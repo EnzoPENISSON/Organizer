@@ -7,6 +7,13 @@ fn main() {
     let root = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let out = std::env::var("OUT_DIR").unwrap();
 
+    // The release workflow tags releases v<version>-build.<run number>. Baking the run number
+    // in lets the update check compare the exe with the latest release.
+    println!("cargo:rerun-if-env-changed=GITHUB_RUN_NUMBER");
+    if let Ok(build) = std::env::var("GITHUB_RUN_NUMBER") {
+        println!("cargo:rustc-env=ORGANIZER_BUILD={build}");
+    }
+
     // Embeds the manifest. It is required, not cosmetic: Windows only allows layered
     // *child* windows (the translucent boxes) for apps that declare Windows 8+ support.
     let manifest = Path::new(&root).join("organizer.manifest");

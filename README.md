@@ -31,6 +31,7 @@ Organizer runs from the system tray (it may be under the `^` overflow arrow).
 | Change the color or design | Tray icon > **Customize design (theme.css)** |
 | Prevent accidental moves | Tray icon > **Lock boxes** |
 | Start at login | Tray icon > **Start with Windows** |
+| Check for updates | Automatic twice a day, or tray icon > **Check for updates**. A notification appears when a newer release is out |
 | Undo everything | Tray icon > **Remove all boxes and restore original layout...** |
 
 Deleting a box leaves its icons where they are. Moving a box over loose icons adds them to it.

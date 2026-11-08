@@ -16,6 +16,7 @@ use crate::{
     render::{self, Layer, Sizes},
     store::{self, Snapshot, State},
     theme::{Align, Theme},
+    update,
 };
 use std::{cell::RefCell, collections::HashMap, rc::Rc, time::SystemTime};
 use windows::{
@@ -34,7 +35,8 @@ use windows::{
                 VK_ESCAPE, VK_LBUTTON, VK_RETURN,
             },
             Shell::{
-                NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, QUNS_BUSY,
+                NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+                NIN_BALLOONUSERCLICK, NOTIFYICONDATAW, QUNS_BUSY,
                 QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN, SHQueryUserNotificationState,
                 ShellExecuteW, Shell_NotifyIconW,
             },
@@ -51,6 +53,12 @@ const WM_TRAY: u32 = WM_APP + 1;
 const WM_FOLLOW: u32 = WM_APP + 2;
 /// Posted by `organizer.exe new` to the running instance.
 const WM_NEW_BOX: u32 = WM_APP + 3;
+/// Posted by the update check's thread when it is done. See `update::check_async`.
+const WM_UPDATE: u32 = WM_APP + 4;
+const UPDATE_TIMER: usize = 2;
+/// The first check waits a minute so it never competes with startup work.
+const UPDATE_FIRST_MS: u32 = 60 * 1000;
+const UPDATE_EVERY_MS: u32 = 12 * 60 * 60 * 1000;
 const EM_SETSEL: u32 = 0x00B1;
 const POLL_TIMER: usize = 1;
 const POLL_MS: u32 = 1000;
@@ -69,6 +77,8 @@ const CMD_AUTOSTART: usize = 3;
 const CMD_RESTORE: usize = 4;
 const CMD_EXIT: usize = 5;
 const CMD_THEME: usize = 6;
+const CMD_CHECK_UPDATE: usize = 7;
+const CMD_DOWNLOAD_UPDATE: usize = 8;
 const CMD_RENAME: usize = 10;
 const CMD_DELETE: usize = 11;
 
@@ -105,6 +115,9 @@ struct App {
     theme_stamp: Option<SystemTime>,
     rendered_size: HashMap<u64, (i32, i32)>,
     follow_pending: bool,
+    /// Tag and page of a newer release, once a check has found one.
+    update: Option<(String, String)>,
+    checking_update: bool,
 }
 
 thread_local! {
@@ -192,6 +205,9 @@ pub fn run(start_with_new_box: bool) {
             new_box();
         }
         SetTimer(Some(host), POLL_TIMER, POLL_MS, None);
+        if update::is_release_build() {
+            SetTimer(Some(host), UPDATE_TIMER, UPDATE_FIRST_MS, None);
+        }
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -239,10 +255,71 @@ fn tray_data() -> NOTIFYICONDATAW {
         hIcon: icon,
         ..Default::default()
     };
-    for (slot, c) in data.szTip.iter_mut().zip("Organizer - desktop boxes".encode_utf16()) {
+    fill_wstr(&mut data.szTip, "Organizer - desktop boxes");
+    data
+}
+
+/// Copies `text` into a fixed, zeroed UTF-16 buffer, truncating to leave its null.
+fn fill_wstr(buf: &mut [u16], text: &str) {
+    let room = buf.len() - 1;
+    for (slot, c) in buf[..room].iter_mut().zip(text.encode_utf16()) {
         *slot = c;
     }
-    data
+}
+
+/// A notification from the tray icon. Clicking it sends `NIN_BALLOONUSERCLICK`.
+fn notify(title: &str, text: &str) {
+    let mut data = tray_data();
+    data.uFlags |= NIF_INFO;
+    data.dwInfoFlags = NIIF_INFO;
+    fill_wstr(&mut data.szInfoTitle, title);
+    fill_wstr(&mut data.szInfo, text);
+    unsafe {
+        let _ = Shell_NotifyIconW(NIM_MODIFY, &data);
+    }
+}
+
+// ---- Updates ----
+
+fn start_update_check(manual: bool) {
+    let (host, busy) = with_app(|a| (a.host, std::mem::replace(&mut a.checking_update, true)));
+    if !busy && !update::check_async(host, WM_UPDATE, manual) {
+        with_app(|a| a.checking_update = false);
+    }
+}
+
+/// Automatic checks speak up only the first time they see a given release; a check from
+/// the menu always answers.
+fn on_update_checked(manual: bool, outcome: update::Outcome) {
+    with_app(|a| a.checking_update = false);
+    match outcome {
+        update::Outcome::Newer { tag, url } => {
+            let seen = with_app(|a| a.update.as_ref().is_some_and(|(t, _)| *t == tag));
+            if manual || !seen {
+                notify("Organizer update available", &format!("{tag} is available. Click to open the download page."));
+            }
+            with_app(|a| a.update = Some((tag, url)));
+        }
+        update::Outcome::UpToDate => {
+            if manual {
+                notify("Organizer is up to date", &format!("You have the latest version: {}.", update::label()));
+            }
+        }
+        update::Outcome::Failed(e) => {
+            store::log(&format!("update check failed: {e}"));
+            if manual {
+                notify("Could not check for updates", &e);
+            }
+        }
+    }
+}
+
+fn open_update_page() {
+    if let Some((_, url)) = with_app(|a| a.update.clone()) {
+        unsafe {
+            ShellExecuteW(None, w!("open"), &HSTRING::from(url), None, None, SW_SHOWNORMAL);
+        }
+    }
 }
 
 fn add_tray_icon() {
@@ -342,6 +419,15 @@ fn show_tray_menu() {
         let _ = AppendMenuW(menu, MF_STRING | check(autostart_enabled()), CMD_AUTOSTART, w!("Start with Windows"));
         let _ = AppendMenuW(menu, MF_STRING, CMD_RESTORE, w!("Remove all boxes and restore original layout..."));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, &HSTRING::from(update::label()));
+        if let Some((tag, _)) = with_app(|a| a.update.clone()) {
+            let item = HSTRING::from(format!("Download update {tag}"));
+            let _ = AppendMenuW(menu, MF_STRING, CMD_DOWNLOAD_UPDATE, &item);
+        }
+        let checking = with_app(|a| a.checking_update);
+        let label = if checking { w!("Checking for updates...") } else { w!("Check for updates") };
+        let _ = AppendMenuW(menu, MF_STRING | if checking { MF_GRAYED } else { MF_ENABLED }, CMD_CHECK_UPDATE, label);
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let _ = AppendMenuW(menu, MF_STRING, CMD_EXIT, w!("Exit"));
         match track_menu(menu) {
             CMD_NEW => new_box(),
@@ -352,6 +438,8 @@ fn show_tray_menu() {
             CMD_THEME => open_theme(),
             CMD_AUTOSTART => set_autostart(!autostart_enabled()),
             CMD_RESTORE => restore_original(),
+            CMD_CHECK_UPDATE => start_update_check(true),
+            CMD_DOWNLOAD_UPDATE => open_update_page(),
             CMD_EXIT => PostQuitMessage(0),
             _ => {}
         }
@@ -1132,9 +1220,16 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
     }
     match msg {
         WM_TIMER if wp.0 == POLL_TIMER => poll(),
+        WM_TIMER if wp.0 == UPDATE_TIMER => {
+            // Replaces the one-minute first timer with the regular interval.
+            unsafe { SetTimer(Some(hwnd), UPDATE_TIMER, UPDATE_EVERY_MS, None) };
+            start_update_check(false);
+        }
+        WM_UPDATE => on_update_checked(wp.0 != 0, unsafe { update::take(lp) }),
         WM_FOLLOW => follow_icons(),
         WM_NEW_BOX => new_box(),
         WM_TRAY if matches!(lp.0 as u32, WM_LBUTTONUP | WM_RBUTTONUP) => show_tray_menu(),
+        WM_TRAY if lp.0 as u32 == NIN_BALLOONUSERCLICK => open_update_page(),
         WM_DISPLAYCHANGE => place_all(),
         WM_DESTROY => unsafe { PostQuitMessage(0) },
         _ => return unsafe { DefWindowProcW(hwnd, msg, wp, lp) },

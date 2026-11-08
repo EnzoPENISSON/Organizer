@@ -6,6 +6,7 @@ mod render;
 mod store;
 mod theme;
 mod ui;
+mod update;
 
 use windows::Win32::System::{
     Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize},
