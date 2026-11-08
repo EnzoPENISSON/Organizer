@@ -20,6 +20,8 @@ Organizer cleans up a cluttered Windows desktop by grouping shortcuts, files and
 boxes you can move, resize and rename. Built to stay out of the way: about 2 MB of RAM, almost
 no CPU, and it stops checking entirely while a fullscreen game runs.
 
+![Task Manager showing organizer.exe at 0% CPU and 0.7 MB of memory](docs/images/resources.png)
+
 Your files never move. Boxes only control where the real desktop icons sit, so opening,
 renaming, right-clicking and dragging icons all work as usual.
 

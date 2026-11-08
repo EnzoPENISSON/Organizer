@@ -131,6 +131,9 @@
   figure img { display: block; width: 100%; height: auto; border-radius: 12px; box-shadow: var(--shadow); }
   figcaption { font-size: 14px; color: var(--muted); margin-top: 14px; text-align: center; }
   @media (min-width: 1000px) { figure { margin-left: -100px; margin-right: -100px; } }
+  figure.usage { margin: 36px 0 0; }
+  figure.usage img { border-radius: 8px; }
+  figure.usage figcaption { text-align: left; margin-top: 10px; }
 
   h2 { font-size: 26px; line-height: 1.25; letter-spacing: -0.02em; font-weight: 650; margin: 80px 0 14px; }
   h3 { font-size: 16.5px; font-weight: 600; margin: 0 0 4px; }
@@ -189,6 +192,12 @@
       <p class="small">No admin prompt. Remove it any time from Settings &gt; Apps.</p>
     </div>
   </section>
+
+  <figure class="usage">
+    <img src="images/resources.png" width="760" height="61"
+         alt="Task Manager showing organizer.exe at 0% CPU and 0.7 MB of memory">
+    <figcaption>Task Manager while it runs: 0% CPU, 0.7 MB of memory.</figcaption>
+  </figure>
 
   <figure>
     <img src="images/desktop.png" width="1919" height="1029"
