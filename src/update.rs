@@ -22,6 +22,11 @@ const USER_AGENT: PCWSTR = w!("Organizer-update-check");
 /// Links from GitHub's answer are only followed inside this repo's releases.
 const RELEASES_URL: &str = "https://github.com/EnzoPENISSON/Organizer/releases";
 const DOWNLOAD_URL: &str = "https://github.com/EnzoPENISSON/Organizer/releases/download/";
+/// The same files through the API. It redirects straight to GitHub's file storage, so it
+/// still works when github.com's download links time out (HTTP 504), which happens.
+const ASSET_API_URL: &str = "https://api.github.com/repos/EnzoPENISSON/Organizer/releases/assets/";
+/// Download attempts over all links, with a growing pause between rounds.
+const DOWNLOAD_ROUNDS: u64 = 3;
 /// Release asset names: `Organizer-Setup-<tag>.exe` (see installer/organizer.iss).
 const INSTALLER_PREFIX: &str = "Organizer-Setup-";
 const MAX_ANSWER: usize = 1 << 20;
@@ -70,8 +75,8 @@ pub struct Release {
     pub tag: String,
     /// The release's web page.
     pub page: String,
-    /// Download link of its installer, if the release has one.
-    pub installer: Option<String>,
+    /// Links to its installer, best first. Empty if the release has none.
+    pub installer: Vec<String>,
 }
 
 pub enum Outcome {
@@ -91,6 +96,9 @@ struct Answer {
 #[derive(Deserialize)]
 struct Asset {
     name: String,
+    /// The API link, which serves the file with `Accept: application/octet-stream`.
+    #[serde(default)]
+    url: String,
     browser_download_url: String,
 }
 
@@ -112,8 +120,12 @@ fn outcome(json: &[u8], current: Version) -> Outcome {
                 .assets
                 .into_iter()
                 .find(|a| a.name.starts_with(INSTALLER_PREFIX) && a.name.ends_with(".exe"))
-                .map(|a| a.browser_download_url)
-                .filter(|url| url.starts_with(DOWNLOAD_URL));
+                .map(|a| {
+                    let api = Some(a.url).filter(|u| u.starts_with(ASSET_API_URL));
+                    let direct = Some(a.browser_download_url).filter(|u| u.starts_with(DOWNLOAD_URL));
+                    api.into_iter().chain(direct).collect()
+                })
+                .unwrap_or_default();
             Outcome::Newer(Release { tag: answer.tag_name, page, installer })
         }
         Some(_) => Outcome::UpToDate,
@@ -141,7 +153,7 @@ fn run_async<T: Send + 'static>(notify: HWND, msg: u32, wparam: usize, work: imp
 
 /// Checks for a newer release. Posts an [`Outcome`], with `wparam` = `manual`.
 pub fn check_async(notify: HWND, msg: u32, manual: bool) -> bool {
-    run_async(notify, msg, manual as usize, || match get(API_HOST, LATEST_PATH, true, MAX_ANSWER) {
+    run_async(notify, msg, manual as usize, || match get(API_HOST, LATEST_PATH, Accept::Json, MAX_ANSWER) {
         Ok(Some(body)) => outcome(&body, current()),
         Ok(None) => Outcome::UpToDate, // no release published yet
         Err(e) => Outcome::Failed(e),
@@ -150,16 +162,41 @@ pub fn check_async(notify: HWND, msg: u32, manual: bool) -> bool {
 
 /// Downloads `release`'s installer to the temp folder. Posts a `Result<PathBuf, String>`.
 pub fn download_async(notify: HWND, msg: u32, release: &Release) -> bool {
-    let Some(url) = release.installer.clone() else { return false };
+    if release.installer.is_empty() {
+        return false;
+    }
+    let links = release.installer.clone();
     // The tag passed parse_tag, but keep the file name plain whatever it holds.
     let safe_tag: String = release.tag.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-')).collect();
     let path = std::env::temp_dir().join(format!("{INSTALLER_PREFIX}{safe_tag}.exe"));
     run_async(notify, msg, 0, move || -> Result<PathBuf, String> {
-        let path_part = url.strip_prefix("https://github.com").ok_or("unexpected download link")?;
-        let body = get("github.com", path_part, false, MAX_INSTALLER)?.ok_or("the installer is missing from the release")?;
+        let body = download(&links)?;
         std::fs::write(&path, body).map_err(|e| format!("could not save the installer: {e}"))?;
         Ok(path)
     })
+}
+
+/// Tries each link in turn, a few rounds, pausing longer each time: GitHub's download
+/// servers sometimes time out for a while. Returns the last error if all fail.
+fn download(links: &[String]) -> Result<Vec<u8>, String> {
+    let mut last = String::from("no download link");
+    for round in 0..DOWNLOAD_ROUNDS {
+        if round > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(3 * round));
+        }
+        for link in links {
+            let Some((host, path)) = link.strip_prefix("https://").and_then(|rest| rest.find('/').map(|i| rest.split_at(i)))
+            else {
+                continue;
+            };
+            match get(host, path, Accept::Binary, MAX_INSTALLER) {
+                Ok(Some(body)) => return Ok(body),
+                Ok(None) => last = "the installer is missing from the release".into(),
+                Err(e) => last = e,
+            }
+        }
+    }
+    Err(last)
 }
 
 /// Claims a result posted by [`check_async`] (`T` = [`Outcome`]) or [`download_async`]
@@ -189,9 +226,17 @@ fn handle(h: *mut c_void, step: &str) -> Result<Handle, String> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum Accept {
+    /// An API answer as JSON.
+    Json,
+    /// A file. The API's asset links need this to send the file instead of its details.
+    Binary,
+}
+
 /// An HTTPS GET. None on 404. Redirects (GitHub serves downloads from another host) are
 /// followed by WinHTTP, which never follows one from HTTPS down to HTTP.
-fn get(host: &str, path: &str, github_api: bool, max: usize) -> Result<Option<Vec<u8>>, String> {
+fn get(host: &str, path: &str, accept: Accept, max: usize) -> Result<Option<Vec<u8>>, String> {
     let fail = |step: &'static str| move |e: windows::core::Error| format!("{step}: {}", e.message());
     unsafe {
         let session = handle(
@@ -213,13 +258,13 @@ fn get(host: &str, path: &str, github_api: bool, max: usize) -> Result<Option<Ve
             ),
             "request",
         )?;
-        let headers: Vec<u16> = if github_api {
-            "Accept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28\r\n".encode_utf16().collect()
-        } else {
-            Vec::new()
-        };
-        let headers = (!headers.is_empty()).then_some(headers.as_slice());
-        WinHttpSendRequest(request.0, headers, None, 0, 0, 0).map_err(fail("send"))?;
+        let headers: Vec<u16> = match accept {
+            Accept::Json => "Accept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28\r\n",
+            Accept::Binary => "Accept: application/octet-stream\r\n",
+        }
+        .encode_utf16()
+        .collect();
+        WinHttpSendRequest(request.0, Some(&headers), None, 0, 0, 0).map_err(fail("send"))?;
         WinHttpReceiveResponse(request.0, std::ptr::null_mut()).map_err(fail("receive"))?;
 
         let (mut status, mut size) = (0u32, size_of::<u32>() as u32);
@@ -280,11 +325,13 @@ mod tests {
     const PAGE: &str = "https://github.com/EnzoPENISSON/Organizer/releases/tag/v0.1.0-build.13";
     const SETUP: &str =
         "https://github.com/EnzoPENISSON/Organizer/releases/download/v0.1.0-build.13/Organizer-Setup-v0.1.0-build.13.exe";
+    const SETUP_API: &str = "https://api.github.com/repos/EnzoPENISSON/Organizer/releases/assets/723586684";
 
-    fn answer(tag: &str, page: &str, assets: &[(&str, &str)]) -> Vec<u8> {
+    /// Assets are (name, API link, direct link).
+    fn answer(tag: &str, page: &str, assets: &[(&str, &str, &str)]) -> Vec<u8> {
         let assets: Vec<_> = assets
             .iter()
-            .map(|(name, url)| serde_json::json!({ "name": name, "browser_download_url": url, "size": 1 }))
+            .map(|(name, api, url)| serde_json::json!({ "name": name, "url": api, "browser_download_url": url, "size": 1 }))
             .collect();
         serde_json::json!({ "tag_name": tag, "html_url": page, "body": "notes", "assets": assets })
             .to_string()
@@ -299,19 +346,22 @@ mod tests {
     }
 
     #[test]
-    fn reports_newer_release_and_its_installer() {
+    fn reports_newer_release_and_its_installer_api_link_first() {
         let r = newer(&answer(
             "v0.1.0-build.13",
             PAGE,
-            &[("organizer.exe", "https://github.com/EnzoPENISSON/Organizer/releases/download/x/organizer.exe"), ("Organizer-Setup-v0.1.0-build.13.exe", SETUP)],
+            &[
+                ("organizer.exe", "", "https://github.com/EnzoPENISSON/Organizer/releases/download/x/organizer.exe"),
+                ("Organizer-Setup-v0.1.0-build.13.exe", SETUP_API, SETUP),
+            ],
         ));
         assert_eq!((r.tag.as_str(), r.page.as_str()), ("v0.1.0-build.13", PAGE));
-        assert_eq!(r.installer.as_deref(), Some(SETUP));
+        assert_eq!(r.installer, [SETUP_API, SETUP]);
     }
 
     #[test]
     fn release_without_installer_still_counts() {
-        assert_eq!(newer(&answer("v0.1.0-build.13", PAGE, &[])).installer, None);
+        assert!(newer(&answer("v0.1.0-build.13", PAGE, &[])).installer.is_empty());
     }
 
     #[test]
@@ -325,10 +375,10 @@ mod tests {
         let r = newer(&answer(
             "v9.0.0",
             "https://example.com/page",
-            &[("Organizer-Setup-v9.0.0.exe", "https://example.com/evil.exe")],
+            &[("Organizer-Setup-v9.0.0.exe", "https://example.com/api/evil", "https://example.com/evil.exe")],
         ));
         assert_eq!(r.page, RELEASES_URL);
-        assert_eq!(r.installer, None);
+        assert!(r.installer.is_empty());
     }
 
     #[test]
@@ -341,10 +391,20 @@ mod tests {
     #[test]
     #[ignore]
     fn live_check_reaches_github() {
-        match get(API_HOST, LATEST_PATH, true, MAX_ANSWER) {
+        match get(API_HOST, LATEST_PATH, Accept::Json, MAX_ANSWER) {
             Ok(Some(body)) => assert!(!matches!(outcome(&body, current()), Outcome::Failed(_))),
             Ok(None) => {} // no release published yet
             Err(e) => panic!("{e}"),
         }
+    }
+
+    /// Downloads the latest installer the way the updater does: `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn live_download_gets_the_installer() {
+        let body = get(API_HOST, LATEST_PATH, Accept::Json, MAX_ANSWER).unwrap().expect("a release");
+        let Outcome::Newer(release) = outcome(&body, [0, 0, 0, 0]) else { panic!("expected a release") };
+        let setup = download(&release.installer[..1]).unwrap(); // the API link alone
+        assert!(setup.len() > 100_000 && setup.starts_with(b"MZ"), "not an exe: {} bytes", setup.len());
     }
 }

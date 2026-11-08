@@ -351,7 +351,7 @@ fn on_update_checked(manual: bool, outcome: update::Outcome) {
         update::Outcome::Newer(release) => {
             let seen = with_app(|a| a.update.as_ref().is_some_and(|r| r.tag == release.tag));
             if manual || !seen {
-                let action = if release.installer.is_some() { "install it" } else { "open the download page" };
+                let action = if release.installer.is_empty() { "open the download page" } else { "install it" };
                 notify("Organizer update available", &format!("{} is available. Click to {action}.", release.tag));
             }
             with_app(|a| a.update = Some(release));
@@ -514,7 +514,7 @@ fn show_tray_menu() {
             let downloading = with_app(|a| a.downloading_update);
             let item = HSTRING::from(if downloading {
                 format!("Downloading update {}...", release.tag)
-            } else if release.installer.is_some() {
+            } else if !release.installer.is_empty() {
                 format!("Install update {}", release.tag)
             } else {
                 format!("Download update {}", release.tag)
