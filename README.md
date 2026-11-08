@@ -28,6 +28,7 @@ renaming, right-clicking and dragging icons all work as usual.
 ## Features
 
 - **Desktop boxes:** group desktop icons into boxes, and drag icons in and out
+- **Roll-up boxes:** fold a box down to its title bar to tuck its icons away, and open it again in one click
 - **Hide the desktop:** double-click empty space to fade out every box and icon
 - **CSS themes:** change colors, borders, glow and fonts with a `theme.css` file
 - **Lightweight:** native Rust, about 2 MB of RAM, no browser engine
@@ -65,6 +66,7 @@ Organizer runs from the system tray (it may be under the `^` overflow arrow).
 | Move a box (its icons follow) | Drag the title bar |
 | Resize a box | Drag the left, right or bottom edge |
 | Rename a box | Double-click the title bar |
+| Roll a box up or open it | Click the arrow at the right of its title bar, or right-click the title bar > **Roll up** / **Expand**. Drop an icon on a rolled-up title bar to add it |
 | Delete a box | Right-click the title bar |
 | Change the color or design | Tray icon > **Customize design (theme.css)** |
 | Hide or show boxes and icons | Double-click empty desktop space, or tray icon > **Hide boxes and icons** |

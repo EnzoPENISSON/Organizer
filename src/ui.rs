@@ -68,6 +68,8 @@ const FADE_TIMER: usize = 3;
 const FADE_MS: f32 = 200.0;
 /// About 60 frames a second, only while a fade runs.
 const FADE_FRAME_MS: u32 = 16;
+const ROLL_TIMER: usize = 4;
+const ROLL_MS: f32 = 220.0;
 const UPDATE_TIMER: usize = 2;
 /// The first check waits a minute so it never competes with startup work.
 const UPDATE_FIRST_MS: u32 = 60 * 1000;
@@ -95,12 +97,24 @@ const CMD_INSTALL_UPDATE: usize = 8;
 const CMD_HIDE: usize = 9;
 const CMD_RENAME: usize = 10;
 const CMD_DELETE: usize = 11;
+const CMD_ROLL: usize = 12;
 
 struct Drag {
     id: u64,
     edges: Edges,
     start: Rect,
     cursor: POINT,
+}
+
+/// A box rolling open or shut. Its window height slides from `from` to `to`.
+struct Roll {
+    from: i32,
+    to: i32,
+    /// Height reached so far.
+    h: i32,
+    start: std::time::Instant,
+    /// Where its icons were put last frame, so each frame only moves the ones that change.
+    icons: Vec<model::Move>,
 }
 
 struct Rename {
@@ -134,6 +148,13 @@ struct App {
     checking_update: bool,
     downloading_update: bool,
     fade: Fade,
+    rolling: HashMap<u64, Roll>,
+}
+
+/// What is on screen of a box: its shown part, at the height a roll has reached so far.
+fn displayed_rect(a: &App, id: u64) -> Option<Rect> {
+    let shown = a.state.boxes.iter().find(|b| b.id == id)?.shown(&a.metrics?);
+    Some(a.rolling.get(&id).map_or(shown, |r| Rect { h: r.h, ..shown }))
 }
 
 /// Hiding the desktop: boxes fade, icons switch off. Not saved, so Organizer always starts
@@ -270,6 +291,9 @@ pub fn run(start_with_new_box: bool) {
         if let Some(d) = with_app(|a| a.desktop.clone().filter(|_| a.fade.hidden)) {
             let _ = d.set_icons_visible(true);
         }
+        // Nor with icons parked out of reach. The boxes stay rolled up in boxes.json.
+        finish_rolls();
+        unpark(&with_app(|a| a.state.boxes.clone()));
         remove_tray_icon();
         unregister_desktop_menu();
         destroy_box_windows();
@@ -561,17 +585,17 @@ fn open_theme() {
 
 fn show_box_menu(id: u64) {
     unsafe {
-        if find_box(id).is_none() {
-            return;
-        }
+        let Some(b) = find_box(id) else { return };
         let Ok(menu) = CreatePopupMenu() else { return };
         let _ = AppendMenuW(menu, MF_STRING, CMD_NEW, w!("New box"));
         let _ = AppendMenuW(menu, MF_STRING, CMD_RENAME, w!("Rename"));
+        let _ = AppendMenuW(menu, MF_STRING, CMD_ROLL, if b.collapsed { w!("Expand") } else { w!("Roll up") });
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let _ = AppendMenuW(menu, MF_STRING, CMD_DELETE, w!("Delete box (icons stay on the desktop)"));
         match track_menu(menu) {
             CMD_NEW => new_box(),
             CMD_RENAME => begin_rename(id),
+            CMD_ROLL => set_collapsed(id, !b.collapsed),
             CMD_DELETE => delete_box(id),
             _ => {}
         }
@@ -600,6 +624,8 @@ fn connect() -> bool {
     with_app(|a| {
         a.desktop = Some(desktop);
         a.metrics = metrics;
+        // The windows are new and `place_all` below puts every icon where it ends up.
+        a.rolling.clear();
     });
     for id in box_ids() {
         create_box_windows(id);
@@ -682,7 +708,8 @@ fn place_all() {
 
 fn poll() {
     // Stay out of the way mid-gesture: a half-finished drag is not a final position.
-    let busy = with_app(|a| a.polling || a.drag.is_some() || a.rename.is_some());
+    // Mid-roll, an open box has some icons still parked, which would read as dragged out.
+    let busy = with_app(|a| a.polling || a.drag.is_some() || a.rename.is_some() || !a.rolling.is_empty());
     if busy || game_is_running() || unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } as u16 & 0x8000 != 0 {
         return;
     }
@@ -842,6 +869,7 @@ fn new_box() {
             name: format!("Box {}", id),
             rect,
             members: Vec::new(),
+            collapsed: false,
         });
         id
     });
@@ -852,7 +880,117 @@ fn new_box() {
     save();
 }
 
+/// Rolls a box up to its title bar, parking its icons off-screen, or opens it again.
+/// The box slides between the two heights. Clicking again mid-roll turns it around.
+fn set_collapsed(id: u64, collapsed: bool) {
+    end_rename(true);
+    let Some((d, m)) = with_app(|a| a.desktop.clone().zip(a.metrics)) else { return };
+    let view = d.hwnd();
+    let host = with_app(|a| {
+        let from = displayed_rect(a, id)?.h;
+        let b = a.state.boxes.iter_mut().find(|b| b.id == id && b.collapsed != collapsed)?;
+        b.collapsed = collapsed;
+        // Settle first, so a box opening near the bottom of the screen slides up before it
+        // grows. Its icons are left to the animation.
+        model::place_members(std::slice::from_mut(b), &m, &|r| area_of(view, r));
+        let to = b.shown(&m).h;
+        let icons = match a.rolling.remove(&id) {
+            Some(turned_around) => turned_around.icons,
+            None => model::rolling_targets(b, &m, from),
+        };
+        a.rolling.insert(id, Roll { from, to, h: from, start: std::time::Instant::now(), icons });
+        Some(a.host)
+    });
+    let Some(host) = host else { return };
+    // Frames move icons with the fast call, which uses the handles read here.
+    if let Err(e) = d.refresh() {
+        store::log(&format!("could not read icons: {e}"));
+    }
+    save();
+    unsafe { SetTimer(Some(host), ROLL_TIMER, FADE_FRAME_MS, None) };
+    roll_step();
+}
+
+/// One frame of every running roll: new heights, and the icons whose rows were just
+/// covered or uncovered. A finished roll ends with `place_all`, so Explorer keeps the result.
+fn roll_step() {
+    let info = with_app(|a| {
+        let (d, m) = a.desktop.clone().zip(a.metrics).filter(|_| !a.rolling.is_empty())?;
+        let (mut moves, mut ids, mut done) = (Vec::new(), Vec::new(), Vec::new());
+        for (&id, r) in a.rolling.iter_mut() {
+            let Some(b) = a.state.boxes.iter().find(|b| b.id == id) else {
+                done.push(id);
+                continue;
+            };
+            let t = (r.start.elapsed().as_secs_f32() * 1000.0 / ROLL_MS).min(1.0);
+            let eased = 1.0 - (1.0 - t).powi(3); // ease-out, like the fade
+            r.h = r.from + ((r.to - r.from) as f32 * eased).round() as i32;
+            let icons = model::rolling_targets(b, &m, r.h);
+            moves.extend(icons.iter().filter(|i| !r.icons.contains(i)).cloned());
+            r.icons = icons;
+            ids.push(id);
+            if t >= 1.0 {
+                done.push(id);
+            }
+        }
+        for id in &done {
+            a.rolling.remove(id);
+        }
+        Some((d, moves, ids, done, a.rolling.is_empty(), a.host))
+    });
+    let Some((d, moves, ids, done, idle, host)) = info else {
+        let host = with_app(|a| a.host);
+        unsafe {
+            let _ = KillTimer(Some(host), ROLL_TIMER);
+        }
+        return;
+    };
+    // Icons first: one leaving is gone before the edge passes over it.
+    if let Err(e) = d.follow(&moves) {
+        store::log(&format!("could not move icons: {e}"));
+    }
+    for id in ids {
+        sync_windows(id);
+    }
+    if idle {
+        unsafe {
+            let _ = KillTimer(Some(host), ROLL_TIMER);
+        }
+    }
+    if !done.is_empty() {
+        place_all();
+    }
+}
+
+/// Jumps every running roll to its end, before anything that needs icons where they belong.
+fn finish_rolls() {
+    let host = with_app(|a| {
+        let rolling = !a.rolling.is_empty();
+        a.rolling.clear();
+        rolling.then_some(a.host)
+    });
+    if let Some(host) = host {
+        unsafe {
+            let _ = KillTimer(Some(host), ROLL_TIMER);
+        }
+        place_all();
+    }
+}
+
+/// Puts the parked icons of these boxes back in their slots, leaving the boxes as they are.
+fn unpark(boxes: &[DesktopBox]) {
+    let Some((d, m)) = with_app(|a| a.desktop.clone().zip(a.metrics)) else { return };
+    if let Err(e) = d.apply(&model::unpark_moves(boxes, &m)) {
+        store::log(&format!("could not bring back the icons of rolled-up boxes: {e}"));
+    }
+}
+
 fn delete_box(id: u64) {
+    finish_rolls();
+    // A deleted box leaves its icons where they are, so a rolled-up one opens first.
+    if let Some(b) = find_box(id) {
+        unpark(&[b]);
+    }
     let handles = with_app(|a| {
         a.state.boxes.retain(|b| b.id != id);
         a.rendered_size.remove(&id);
@@ -879,6 +1017,9 @@ fn restore_original() {
             return;
         }
     }
+    // Icons added since the snapshot are not in it, so none may stay parked.
+    finish_rolls();
+    unpark(&with_app(|a| a.state.boxes.clone()));
     destroy_box_windows();
     with_app(|a| a.state.boxes.clear());
     save();
@@ -1206,9 +1347,7 @@ fn place_windows(id: u64, frame: HWND, tint: HWND, r: &Rect) {
 
 fn sync_windows(id: u64) {
     let info = with_app(|a| {
-        let handles = *a.windows.get(&id)?;
-        let rect = a.state.boxes.iter().find(|b| b.id == id)?.rect;
-        Some((handles, rect))
+        Some((*a.windows.get(&id)?, displayed_rect(a, id)?))
     });
     if let Some(((frame, tint), rect)) = info {
         place_windows(id, frame, tint, &rect);
@@ -1219,17 +1358,18 @@ fn sync_windows(id: u64) {
 /// nothing stays allocated here and an idle box costs no CPU.
 fn repaint(id: u64) {
     let Some(b) = find_box(id) else { return };
-    let Some(((frame, tint), t, m, view)) = with_app(|a| {
-        Some((*a.windows.get(&id)?, a.theme.clone(), a.metrics?, a.desktop.as_ref()?.hwnd()))
+    let Some(((frame, tint), t, m, view, shown)) = with_app(|a| {
+        Some((*a.windows.get(&id)?, a.theme.clone(), a.metrics?, a.desktop.as_ref()?.hwnd(), displayed_rect(a, id)?))
     }) else {
         return;
     };
     let s = sizes(&t, &m, view);
     let accent = t.accent;
-    let (w, h) = (b.rect.w, b.rect.h);
+    let (w, h) = (shown.w, shown.h);
 
     let mut top = render::frame_layer(&t, &s, accent, w, h);
-    if let Some(mask) = title_mask(&b.name, &t, m.title, w, view) {
+    if let Some(mut mask) = title_mask(&b.name, &t, m.title, w, view) {
+        render::draw_chevron(&mut mask, w, roll_chevron(&m, w, b.collapsed));
         render::blend_mask(&mut top, &mask, w, m.title, t.title_color.resolve(accent));
     }
     show_layer(frame, &top);
@@ -1301,14 +1441,40 @@ fn title_mask(name: &str, t: &Theme, title_h: i32, w: i32, view: HWND) -> Option
             Align::Center => DT_CENTER,
             Align::Right => DT_RIGHT,
         };
+        // The text keeps clear of the roll-up button, and centered text stays centered.
         let pad = px(t.title_padding);
-        let mut rect = RECT { left: pad, top: 0, right: w - pad, bottom: title_h };
+        let left = if t.text_align == Align::Center { pad.max(title_h) } else { pad };
+        let mut rect = RECT { left, top: 0, right: w - pad.max(title_h), bottom: title_h };
         let mut text: Vec<u16> = shown.encode_utf16().collect();
         DrawTextW(dc, &mut text, &mut rect, align | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
         SelectObject(dc, previous);
         let _ = DeleteObject(font.into());
         bits.iter().map(|p| ((p >> 8) & 0xFF) as u8).collect()
     })
+}
+
+/// The roll-up button: a square at the right end of the title bar.
+fn on_roll_button(x: i32, y: i32, w: i32, m: &Metrics) -> bool {
+    (0..m.title).contains(&y) && (w - m.title..w).contains(&x)
+}
+
+/// The button's mark, pointing up to roll the box up or down to open it.
+fn roll_chevron(m: &Metrics, w: i32, collapsed: bool) -> render::Chevron {
+    let title = m.title as f32;
+    render::Chevron {
+        cx: w as f32 - title / 2.0,
+        cy: title / 2.0,
+        half: title * 0.16,
+        stroke: (title / 20.0).max(1.0),
+        up: !collapsed,
+    }
+}
+
+fn hits_roll_button(hwnd: HWND, p: POINT) -> bool {
+    let id = box_id(hwnd);
+    find_box(id)
+        .zip(with_app(|a| a.metrics))
+        .is_some_and(|(b, m)| on_roll_button(p.x, p.y, b.rect.w, &m))
 }
 
 fn hit_edges(x: i32, y: i32, r: &Rect, m: &Metrics) -> Edges {
@@ -1336,6 +1502,7 @@ fn client_point(lp: LPARAM) -> POINT {
 }
 
 fn begin_drag(hwnd: HWND, lp: LPARAM) {
+    finish_rolls();
     let id = box_id(hwnd);
     let Some(b) = find_box(id) else { return };
     let Some((m, locked)) = with_app(|a| a.metrics.map(|m| (m, a.state.locked))) else { return };
@@ -1347,7 +1514,8 @@ fn begin_drag(hwnd: HWND, lp: LPARAM) {
     unsafe {
         let _ = ClientToScreen(hwnd, &mut cursor);
     }
-    let edges = hit_edges(p.x, p.y, &b.rect, &m);
+    // A rolled-up box is only a title bar, so it can be moved but not resized.
+    let edges = hit_edges(p.x, p.y, &b.shown(&m), &m);
     if let Some(d) = with_app(|a| a.desktop.clone()) {
         if let Err(e) = d.refresh() {
             store::log(&format!("could not read icons: {e}"));
@@ -1369,12 +1537,12 @@ fn continue_drag(hwnd: HWND, lp: LPARAM) {
     }
     let min_h = m.height_for(m.min_width(), 1);
     let rect = model::drag_rect(start, edges, cursor.x - origin.x, cursor.y - origin.y, m.min_width(), min_h);
-    with_app(|a| {
-        if let Some(b) = a.state.boxes.iter_mut().find(|b| b.id == id) {
-            b.rect = rect;
-        }
+    let shown = with_app(|a| {
+        let b = a.state.boxes.iter_mut().find(|b| b.id == id)?;
+        b.rect = rect;
+        Some(b.shown(&m))
     });
-    place_windows(id, frame, tint, &rect);
+    place_windows(id, frame, tint, &shown.unwrap_or(rect));
 
     // Asking Explorer to move icons is posted, so fast mouse movement collapses into
     // one move and the box itself never waits for Explorer.
@@ -1395,18 +1563,9 @@ fn follow_icons() {
     let info = with_app(|a| {
         a.follow_pending = false;
         let id = a.drag.as_ref()?.id;
-        let b = a.state.boxes.iter().find(|b| b.id == id)?;
-        let m = a.metrics?;
-        let moves: Vec<model::Move> = b
-            .members
-            .iter()
-            .enumerate()
-            .map(|(i, key)| {
-                let (x, y) = m.slot(&b.rect, i);
-                model::Move { key: key.clone(), x, y }
-            })
-            .collect();
-        Some((a.desktop.clone()?, moves))
+        // A rolled-up box's icons are parked, so they have nowhere to follow it.
+        let b = a.state.boxes.iter().find(|b| b.id == id && !b.collapsed)?;
+        Some((a.desktop.clone()?, b.targets(&a.metrics?)))
     });
     if let Some((d, moves)) = info {
         if let Err(e) = d.follow(&moves) {
@@ -1423,6 +1582,12 @@ fn end_drag() {
 
 unsafe extern "system" fn frame_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
+        // Like a push button, the second click of a double-click on it is a click too.
+        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK if hits_roll_button(hwnd, client_point(lp)) => {
+            if let Some(b) = find_box(box_id(hwnd)) {
+                set_collapsed(b.id, !b.collapsed);
+            }
+        }
         WM_LBUTTONDOWN => begin_drag(hwnd, lp),
         WM_MOUSEMOVE => continue_drag(hwnd, lp),
         WM_LBUTTONUP => unsafe {
@@ -1435,13 +1600,13 @@ unsafe extern "system" fn frame_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
         WM_RBUTTONUP => show_box_menu(box_id(hwnd)),
         WM_SETCURSOR => unsafe {
             let id = box_id(hwnd);
+            let mut p = POINT::default();
+            let _ = GetCursorPos(&mut p);
+            let _ = ScreenToClient(hwnd, &mut p);
             let cursor = match (find_box(id), with_app(|a| a.metrics.map(|m| (m, a.state.locked)))) {
-                (Some(b), Some((m, false))) => {
-                    let mut p = POINT::default();
-                    let _ = GetCursorPos(&mut p);
-                    let _ = ScreenToClient(hwnd, &mut p);
-                    cursor_for(hit_edges(p.x, p.y, &b.rect, &m))
-                }
+                // Rolling up never moves anything, so it works while the boxes are locked.
+                (Some(b), Some((m, _))) if on_roll_button(p.x, p.y, b.rect.w, &m) => IDC_HAND,
+                (Some(b), Some((m, false))) => cursor_for(hit_edges(p.x, p.y, &b.shown(&m), &m)),
                 _ => IDC_ARROW,
             };
             SetCursor(LoadCursorW(None, cursor).ok());
@@ -1474,6 +1639,7 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             start_update_check(false);
         }
         WM_TIMER if wp.0 == FADE_TIMER => fade_step(),
+        WM_TIMER if wp.0 == ROLL_TIMER => roll_step(),
         WM_DESKTOP_DOUBLE_CLICK => on_desktop_double_click(lp),
         WM_UPDATE => on_update_checked(wp.0 != 0, unsafe { update::take(lp) }),
         WM_UPDATE_DOWNLOADED => on_update_downloaded(unsafe { update::take(lp) }),

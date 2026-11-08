@@ -186,6 +186,45 @@ pub fn blend_mask(layer: &mut Layer, mask: &[u8], mask_w: i32, mask_h: i32, colo
     }
 }
 
+/// The roll-up button's mark: an open V, in pixels within a mask.
+#[derive(Clone, Copy, Debug)]
+pub struct Chevron {
+    pub cx: f32,
+    pub cy: f32,
+    /// Half its width.
+    pub half: f32,
+    /// Line thickness.
+    pub stroke: f32,
+    /// Points up (roll up) rather than down (open).
+    pub up: bool,
+}
+
+fn segment_distance((px, py): (f32, f32), (ax, ay): (f32, f32), (bx, by): (f32, f32)) -> f32 {
+    let (dx, dy) = (bx - ax, by - ay);
+    let t = (((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy).max(f32::EPSILON)).clamp(0.0, 1.0);
+    ((px - ax - t * dx).powi(2) + (py - ay - t * dy).powi(2)).sqrt()
+}
+
+/// Adds an antialiased chevron to a coverage mask, one byte per pixel, `w` wide.
+pub fn draw_chevron(mask: &mut [u8], w: i32, c: Chevron) {
+    let h = mask.len() as i32 / w.max(1);
+    let rise = if c.up { -c.half / 2.0 } else { c.half / 2.0 };
+    let tip = (c.cx, c.cy + rise);
+    let arms = [(c.cx - c.half, c.cy - rise), (c.cx + c.half, c.cy - rise)];
+    let reach = c.half + c.stroke;
+    let (x0, x1) = (((c.cx - reach).floor() as i32).max(0), ((c.cx + reach).ceil() as i32).min(w));
+    let (y0, y1) = (((c.cy - reach).floor() as i32).max(0), ((c.cy + reach).ceil() as i32).min(h));
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let p = (x as f32 + 0.5, y as f32 + 0.5);
+            let d = arms.iter().map(|&a| segment_distance(p, a, tip)).fold(f32::MAX, f32::min);
+            let cover = (coverage(d - c.stroke / 2.0) * 255.0).round() as u8;
+            let m = &mut mask[(y * w + x) as usize];
+            *m = (*m).max(cover);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,6 +305,27 @@ mod tests {
         let mask = vec![255u8; 50 * 28];
         blend_mask(&mut l, &mask, 50, 28, Rgba::from_rgb24(0xFFFFFF));
         assert_eq!(l.px[(10 * 50 + 25) as usize], 0xFFFFFFFF);
+    }
+
+    #[test]
+    fn chevron_points_the_way_it_is_told() {
+        let at = |mask: &[u8], x: i32, y: i32| mask[(y * 40 + x) as usize];
+        for up in [false, true] {
+            let mut mask = vec![0u8; 40 * 40];
+            // Centered on a pixel center, so the tip and arm ends fall exactly on pixels.
+            draw_chevron(&mut mask, 40, Chevron { cx: 20.5, cy: 20.5, half: 8.0, stroke: 2.0, up });
+            let (tip, arms) = if up { (16, 24) } else { (24, 16) };
+            assert_eq!(at(&mask, 20, tip), 255, "tip, up={up}");
+            assert_eq!(at(&mask, 12, arms), 255, "left arm end, up={up}");
+            assert_eq!(at(&mask, 20, arms), 0, "open between the arms, up={up}");
+            assert_eq!(at(&mask, 2, 2), 0, "nothing outside, up={up}");
+        }
+    }
+
+    #[test]
+    fn chevron_near_the_mask_edge_does_not_panic() {
+        let mut mask = vec![0u8; 10 * 10];
+        draw_chevron(&mut mask, 10, Chevron { cx: 9.0, cy: 1.0, half: 8.0, stroke: 2.0, up: true });
     }
 
     #[test]

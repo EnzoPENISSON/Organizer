@@ -27,6 +27,58 @@ pub struct DesktopBox {
     pub rect: Rect,
     /// Shell parsing names of the icons in this box, in display order.
     pub members: Vec<String>,
+    /// Rolled up to its title bar. `rect` keeps the open size, and the icons wait at
+    /// `PARKED` until the box opens again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub collapsed: bool,
+}
+
+impl DesktopBox {
+    /// The part on screen: the whole box, or only its title bar when rolled up.
+    pub fn shown(&self, m: &Metrics) -> Rect {
+        if self.collapsed { Rect { h: m.title, ..self.rect } } else { self.rect }
+    }
+
+    /// Where each member belongs: its slot, or `PARKED` when the box is rolled up.
+    pub fn targets(&self, m: &Metrics) -> Vec<Move> {
+        self.members
+            .iter()
+            .enumerate()
+            .map(|(i, key)| {
+                let (x, y) = if self.collapsed { PARKED } else { m.slot(&self.rect, i) };
+                Move { key: key.clone(), x, y }
+            })
+            .collect()
+    }
+}
+
+/// Where a rolled-up box keeps its icons: past the edge of any real screen, and inside
+/// the 16-bit range Explorer's icon list accepts.
+pub const PARKED: (i32, i32) = (30000, 30000);
+
+/// Where a box's members go while it rolls open or shut and shows `h` pixels of itself.
+/// Icons can't be clipped, so each one waits, parked, until its whole cell is covered.
+pub fn rolling_targets(b: &DesktopBox, m: &Metrics, h: i32) -> Vec<Move> {
+    b.members
+        .iter()
+        .enumerate()
+        .map(|(i, key)| {
+            let (x, y) = m.slot(&b.rect, i);
+            let covered = y - m.icon_y + m.cell_h <= b.rect.y + h;
+            let (x, y) = if covered { (x, y) } else { PARKED };
+            Move { key: key.clone(), x, y }
+        })
+        .collect()
+}
+
+/// Puts the icons of rolled-up boxes back in their slots without opening the boxes, so
+/// no icon is left out of reach when Organizer quits or a box goes away.
+pub fn unpark_moves(boxes: &[DesktopBox], m: &Metrics) -> Vec<Move> {
+    boxes
+        .iter()
+        .filter(|b| b.collapsed)
+        .flat_map(|b| DesktopBox { collapsed: false, ..b.clone() }.targets(m))
+        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -166,12 +218,15 @@ pub fn free_spot(area: &Rect, w: i32, h: i32, icons: &[Icon], boxes: &[DesktopBo
     fit_rect(Rect { x: area.x + (area.w - w) / 2, y: area.y + (area.h - h) / 2, w, h }, area)
 }
 
-/// Grows a box to hold its members, then keeps it in its work area.
+/// Grows a box to hold its members, then keeps the part on screen in its work area.
+/// A rolled-up box near the bottom stays put; it moves up only once it opens.
 fn settle_rect(b: &mut DesktopBox, m: &Metrics, area_of: &dyn Fn(&Rect) -> Rect) -> bool {
     let before = b.rect;
     b.rect.w = b.rect.w.max(m.min_width());
     b.rect.h = b.rect.h.max(m.height_for(b.rect.w, b.members.len()));
-    b.rect = fit_rect(b.rect, &area_of(&b.rect));
+    let shown = b.shown(m);
+    let fitted = fit_rect(shown, &area_of(&shown));
+    (b.rect.x, b.rect.y) = (fitted.x, fitted.y);
     b.rect != before
 }
 
@@ -182,10 +237,7 @@ pub fn place_members(boxes: &mut [DesktopBox], m: &Metrics, area_of: &dyn Fn(&Re
     let mut moves = Vec::new();
     for b in boxes {
         settle_rect(b, m, area_of);
-        for (i, key) in b.members.iter().enumerate() {
-            let (x, y) = m.slot(&b.rect, i);
-            moves.push(Move { key: key.clone(), x, y });
-        }
+        moves.extend(b.targets(m));
     }
     moves
 }
@@ -201,7 +253,8 @@ pub struct Outcome {
 
 /// Compares the icons' actual positions with the boxes and works out what the user did:
 /// an icon dragged out leaves its box, one dropped in joins (at the drop position), one
-/// dragged within its box is reordered, and deleted files drop out.
+/// dragged within its box is reordered, and deleted files drop out. A rolled-up box keeps
+/// its parked icons wherever they are, and takes icons dropped on its title bar.
 pub fn reconcile(
     boxes: &mut [DesktopBox],
     icons: &[Icon],
@@ -212,11 +265,11 @@ pub fn reconcile(
     let by_key: HashMap<&str, &Icon> = icons.iter().map(|i| (i.key.as_str(), i)).collect();
 
     for b in boxes.iter_mut() {
-        let (rect, before) = (b.rect, b.members.len());
+        let (rect, collapsed, before) = (b.rect, b.collapsed, b.members.len());
         b.members.retain(|k| {
             by_key.get(k.as_str()).is_some_and(|i| {
                 let (cx, cy) = m.center(i.x, i.y);
-                rect.contains(cx, cy)
+                collapsed || rect.contains(cx, cy)
             })
         });
         out.changed |= b.members.len() != before;
@@ -225,7 +278,7 @@ pub fn reconcile(
     let owned: HashSet<String> = boxes.iter().flat_map(|b| b.members.iter().cloned()).collect();
     for icon in icons.iter().filter(|i| !owned.contains(&i.key)) {
         let (cx, cy) = m.center(icon.x, icon.y);
-        if let Some(b) = boxes.iter_mut().find(|b| b.rect.contains(cx, cy)) {
+        if let Some(b) = boxes.iter_mut().find(|b| b.shown(m).contains(cx, cy)) {
             b.members.push(icon.key.clone());
             out.changed = true;
         }
@@ -235,6 +288,16 @@ pub fn reconcile(
         if settle_rect(b, m, area_of) {
             out.resized.push(b.id);
             out.changed = true;
+        }
+
+        // Nothing to reorder while rolled up. Icons that drifted out of the parking spot,
+        // such as one just dropped on the title bar, go back to it.
+        if b.collapsed {
+            out.moves.extend(b.targets(m).into_iter().filter(|t| {
+                let icon = by_key[t.key.as_str()];
+                (icon.x, icon.y) != (t.x, t.y)
+            }));
+            continue;
         }
 
         // Only icons sitting off the grid were placed by the user. Icons still on a
@@ -294,7 +357,11 @@ mod tests {
             name: "t".into(),
             rect: Rect { x: 100, y: 100, w: 320, h: 400 },
             members: members.iter().map(|s| s.to_string()).collect(),
+            collapsed: false,
         }
+    }
+    fn rolled_up(members: &[&str]) -> DesktopBox {
+        DesktopBox { collapsed: true, ..make_box(members) }
     }
     fn icon(key: &str, (x, y): (i32, i32)) -> Icon {
         Icon { key: key.into(), x, y }
@@ -439,6 +506,87 @@ mod tests {
             .flat_map(|x| (0..11).map(move |y| icon("i", (x * 100, y * 100))))
             .collect();
         assert_eq!(free_spot(&AREA, 340, 240, &icons, &[], &M), Rect { x: 790, y: 400, w: 340, h: 240 });
+    }
+
+    #[test]
+    fn rolled_up_box_shows_only_its_title_and_parks_its_icons() {
+        let mut bs = [rolled_up(&["a", "b"])];
+        assert_eq!(bs[0].shown(&M), Rect { h: M.title, ..bs[0].rect });
+        let moves = place_members(&mut bs, &M, &area);
+        assert!(moves.iter().all(|m| (m.x, m.y) == PARKED), "{moves:?}");
+    }
+
+    #[test]
+    fn rolled_up_box_keeps_its_parked_icons() {
+        let mut bs = [rolled_up(&["a", "b"])];
+        let icons = [icon("a", PARKED), icon("b", PARKED)];
+        let o = reconcile(&mut bs, &icons, &M, &area);
+        assert_eq!(members(&bs[0]), ["a", "b"]);
+        assert!(!o.changed && o.moves.is_empty());
+    }
+
+    #[test]
+    fn rolled_up_box_parks_an_icon_that_came_back() {
+        let mut bs = [rolled_up(&["a", "b"])];
+        let icons = [icon("a", PARKED), icon("b", (1500, 800))];
+        let o = reconcile(&mut bs, &icons, &M, &area);
+        assert_eq!(members(&bs[0]), ["a", "b"]);
+        assert_eq!(o.moves, [Move { key: "b".into(), x: PARKED.0, y: PARKED.1 }]);
+    }
+
+    #[test]
+    fn icon_dropped_on_a_rolled_up_title_joins_and_is_parked() {
+        let mut bs = [rolled_up(&["a"])];
+        // Its cell's center, which decides where an icon is, lands on the title bar.
+        let icons = [icon("a", PARKED), icon("new", (150, 60))];
+        let o = reconcile(&mut bs, &icons, &M, &area);
+        assert_eq!(members(&bs[0]), ["a", "new"]);
+        assert!(o.changed);
+        assert_eq!(o.moves, [Move { key: "new".into(), x: PARKED.0, y: PARKED.1 }]);
+    }
+
+    #[test]
+    fn icons_where_a_rolled_up_body_would_be_stay_loose() {
+        let mut bs = [rolled_up(&[])];
+        let o = reconcile(&mut bs, &[icon("x", (150, 300))], &M, &area);
+        assert!(bs[0].members.is_empty() && !o.changed && o.moves.is_empty());
+    }
+
+    #[test]
+    fn rolled_up_box_at_the_bottom_is_not_pushed_up() {
+        let mut bs = [rolled_up(&["a"])];
+        bs[0].rect.y = AREA.h - M.title;
+        place_members(&mut bs, &M, &area);
+        assert_eq!(bs[0].rect.y, AREA.h - M.title);
+    }
+
+    #[test]
+    fn unparking_puts_icons_in_their_slots_and_leaves_boxes_rolled_up() {
+        let bs = [rolled_up(&["a", "b"]), make_box(&["c"])];
+        let moves = unpark_moves(&bs, &M);
+        assert_eq!(moves, [
+            Move { key: "a".into(), x: slot(&bs[0], 0).0, y: slot(&bs[0], 0).1 },
+            Move { key: "b".into(), x: slot(&bs[0], 1).0, y: slot(&bs[0], 1).1 },
+        ]);
+        assert!(bs[0].collapsed);
+    }
+
+    #[test]
+    fn rolling_shows_icons_row_by_row_as_the_box_covers_them() {
+        let b = make_box(&["a", "b", "c", "d"]); // 3 columns: a b c, then d
+        let parked = |h| rolling_targets(&b, &M, h).iter().filter(|t| (t.x, t.y) == PARKED).count();
+        assert_eq!(parked(M.title), 4, "only the title bar: all tucked away");
+        assert_eq!(parked(M.title + M.pad + M.cell_h), 1, "first row covered");
+        assert_eq!(parked(M.height_for(b.rect.w, 4)), 0, "fully open");
+        let open = rolling_targets(&b, &M, M.height_for(b.rect.w, 4));
+        assert_eq!(open, DesktopBox { collapsed: false, ..b.clone() }.targets(&M));
+    }
+
+    #[test]
+    fn boxes_saved_before_roll_up_existed_load_open() {
+        let json = r#"{"id":1,"name":"t","rect":{"x":0,"y":0,"w":10,"h":10},"members":[]}"#;
+        let b: DesktopBox = serde_json::from_str(json).unwrap();
+        assert!(!b.collapsed);
     }
 
     #[test]
