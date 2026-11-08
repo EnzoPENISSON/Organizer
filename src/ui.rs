@@ -14,6 +14,7 @@ use crate::{
     desktop::Desktop,
     model::{self, DesktopBox, Edges, Metrics, Rect},
     render::{self, Layer, Sizes},
+    settings,
     store::{self, Snapshot, State},
     theme::{Align, Theme},
     update, watch,
@@ -39,7 +40,7 @@ use windows::{
             },
             Shell::{
                 NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY,
-                NIN_BALLOONUSERCLICK, NOTIFYICONDATAW, QUNS_BUSY,
+                NIN_BALLOONUSERCLICK, NOTIFYICONDATAW, QUNS_BUSY, SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify,
                 QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN, SHQueryUserNotificationState,
                 ShellExecuteW, Shell_NotifyIconW,
             },
@@ -80,6 +81,10 @@ const POLL_MS: u32 = 1000;
 const TICKS_PER_TRIM: u32 = 30;
 /// Catches what happens away from the desktop, like a file deleted from another window.
 const TICKS_PER_FULL_CHECK: u32 = 30;
+/// Checks before the layout is put back after a reload, so Explorer is done refilling the
+/// desktop, and the most to wait if its icon count never settles.
+const RELOAD_MIN_CHECKS: u32 = 2;
+const RELOAD_MAX_CHECKS: u32 = 10;
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 const RUN_VALUE: PCWSTR = w!("Organizer");
 /// The desktop background's right-click menu. On Windows 11 it is under "Show more options".
@@ -98,12 +103,20 @@ const CMD_HIDE: usize = 9;
 const CMD_RENAME: usize = 10;
 const CMD_DELETE: usize = 11;
 const CMD_ROLL: usize = 12;
+const CMD_SETTINGS: usize = 13;
 
 struct Drag {
     id: u64,
     edges: Edges,
     start: Rect,
     cursor: POINT,
+}
+
+/// Where every icon was just before Organizer made Explorer reload the desktop. Explorer
+/// may put icons anywhere while reloading, even back in its default layout.
+struct Reload {
+    before: Vec<model::Icon>,
+    checks: u32,
 }
 
 /// A box rolling open or shut. Its window height slides from `from` to `to`.
@@ -149,6 +162,12 @@ struct App {
     downloading_update: bool,
     fade: Fade,
     rolling: HashMap<u64, Roll>,
+    /// A desktop reload Organizer started, waiting for Explorer to finish it.
+    reload: Option<Reload>,
+    /// Icons as the last trusted check saw them, to undo a layout reset. See `poll_inner`.
+    last_icons: Vec<model::Icon>,
+    /// Icons seen by the last check, trusted or not.
+    last_icon_count: usize,
 }
 
 /// What is on screen of a box: its shown part, at the height a roll has reached so far.
@@ -283,6 +302,9 @@ pub fn run(start_with_new_box: bool) {
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            if settings::translate(&msg) {
+                continue;
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -446,11 +468,52 @@ fn remove_tray_icon() {
     }
 }
 
-fn autostart_enabled() -> bool {
+pub(crate) fn autostart_enabled() -> bool {
     unsafe { RegGetValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE, RRF_RT_REG_SZ, None, None, None).is_ok() }
 }
 
-fn set_autostart(enable: bool) {
+pub(crate) fn locked() -> bool {
+    with_app(|a| a.state.locked)
+}
+
+pub(crate) fn set_locked(locked: bool) {
+    with_app(|a| a.state.locked = locked);
+    save();
+}
+
+pub(crate) fn double_click_hides() -> bool {
+    with_app(|a| a.state.double_click_hides)
+}
+
+/// Turning it off while hidden shows everything again, since the gesture to do so is gone.
+pub(crate) fn set_double_click_hides(on: bool) {
+    with_app(|a| a.state.double_click_hides = on);
+    save();
+    if !on {
+        set_hidden(false);
+    }
+}
+
+/// Makes Explorer reload the desktop, as F5 does, so it applies a changed Windows setting.
+/// Explorer does not reliably keep icon positions through a reload (it can fall back to its
+/// default layout), so the layout is recorded first and put back once the reload is done.
+pub(crate) fn refresh_desktop() {
+    finish_rolls();
+    let d = with_app(|a| a.desktop.clone());
+    if let Some(d) = &d {
+        let before = d.icons().unwrap_or_default();
+        with_app(|a| {
+            // Toggled again mid-reload: the layout recorded first is still the right one.
+            let before = a.reload.take().map_or(before, |r| r.before);
+            a.reload = Some(Reload { before, checks: 0 });
+        });
+    }
+    if !matches!(d.map(|d| d.refresh_view()), Some(Ok(()))) {
+        unsafe { SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None) };
+    }
+}
+
+pub(crate) fn set_autostart(enable: bool) {
     unsafe {
         let mut key = HKEY::default();
         if RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY, None, KEY_SET_VALUE, &mut key).is_err() {
@@ -525,10 +588,8 @@ fn show_tray_menu() {
         let locked = with_app(|a| a.state.locked);
         let check = |on: bool| if on { MF_CHECKED } else { MF_UNCHECKED };
         let _ = AppendMenuW(menu, MF_STRING, CMD_NEW, w!("New box"));
-        let _ = AppendMenuW(menu, MF_STRING | check(locked), CMD_LOCK, w!("Lock boxes"));
         let hidden = with_app(|a| a.fade.hidden);
-        let _ = AppendMenuW(menu, MF_STRING | check(hidden), CMD_HIDE, w!("Hide boxes and icons\tDouble-click desktop"));
-        let _ = AppendMenuW(menu, MF_STRING, CMD_THEME, w!("Customize design (theme.css)"));
+        let _ = AppendMenuW(menu, MF_STRING, CMD_SETTINGS, w!("Settings..."));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let _ = AppendMenuW(menu, MF_STRING | check(autostart_enabled()), CMD_AUTOSTART, w!("Start with Windows"));
         let _ = AppendMenuW(menu, MF_STRING, CMD_RESTORE, w!("Remove all boxes and restore original layout..."));
@@ -553,11 +614,9 @@ fn show_tray_menu() {
         let _ = AppendMenuW(menu, MF_STRING, CMD_EXIT, w!("Exit"));
         match track_menu(menu) {
             CMD_NEW => new_box(),
-            CMD_LOCK => {
-                with_app(|a| a.state.locked = !a.state.locked);
-                save();
-            }
+            CMD_LOCK => set_locked(!locked),
             CMD_THEME => open_theme(),
+            CMD_SETTINGS => settings::open(),
             CMD_HIDE => set_hidden(!hidden),
             CMD_AUTOSTART => set_autostart(!autostart_enabled()),
             CMD_RESTORE => restore_original(),
@@ -566,10 +625,11 @@ fn show_tray_menu() {
             CMD_EXIT => PostQuitMessage(0),
             _ => {}
         }
+        settings::refresh();
     }
 }
 
-fn open_theme() {
+pub(crate) fn open_theme() {
     if !store::theme_path().exists() {
         store::load_theme();
     }
@@ -810,7 +870,8 @@ fn poll_inner() {
         }
     }
     reload_theme_if_changed(&d);
-    if !icons_need_checking() {
+    // A pending reload is watched every second until it is done.
+    if !icons_need_checking() && with_app(|a| a.reload.is_none()) {
         return;
     }
     let result = (|| {
@@ -825,14 +886,49 @@ fn poll_inner() {
             return;
         }
     };
-    // An empty list is Explorer still loading, not every file having been deleted.
-    if icons.is_empty() {
+    // An empty list is Explorer still loading, not every file having been deleted. While it
+    // reloads the desktop (F5, a changed setting) the list also fills in over a moment, and
+    // icons not back yet would read as gone: they would leave their boxes and come back in
+    // a shuffled order. So the list is only trusted once two checks in a row agree on its size.
+    let settled = with_app(|a| std::mem::replace(&mut a.last_icon_count, icons.len()) == icons.len());
+    let settled = settled && !icons.is_empty();
+    let view = d.hwnd();
+
+    // After a reload Organizer started, or one that reset the layout on its own, nothing
+    // the user did is in these positions: put the recorded layout back instead of reading
+    // them as drags. Boxes keep their members.
+    let reload = with_app(|a| {
+        a.metrics = Some(m);
+        let r = a.reload.as_mut()?;
+        r.checks += 1;
+        let done = (settled && r.checks >= RELOAD_MIN_CHECKS) || r.checks >= RELOAD_MAX_CHECKS;
+        Some(done.then(|| a.reload.take().map(|r| r.before)).flatten())
+    });
+    let reset = match reload {
+        Some(Some(before)) => Some(before),
+        Some(None) => return, // still reloading
+        None if !settled => return,
+        None => with_app(|a| model::looks_like_reset(&a.state.boxes, &icons, &m).then(|| a.last_icons.clone())),
+    };
+    if let Some(before) = reset {
+        store::log("the desktop was reloaded, putting the icons back");
+        let moves = with_app(|a| model::restore_layout(&mut a.state.boxes, &before, &icons, &m, &|r| area_of(view, r)));
+        for id in box_ids() {
+            sync_windows(id);
+        }
+        if let Err(e) = d.apply(&moves) {
+            store::log(&format!("could not move icons: {e}"));
+        }
+        // The next check compares against the restored layout, not this one.
+        with_app(|a| a.last_icons = before);
+        save();
         return;
     }
-    let view = d.hwnd();
+
     let outcome = with_app(|a| {
-        a.metrics = Some(m);
-        model::reconcile(&mut a.state.boxes, &icons, &m, &|r| area_of(view, r))
+        let outcome = model::reconcile(&mut a.state.boxes, &icons, &m, &|r| area_of(view, r));
+        a.last_icons = icons.clone();
+        outcome
     });
     for id in &outcome.resized {
         sync_windows(*id);
@@ -1165,7 +1261,7 @@ fn create_box_windows(id: u64) {
 fn on_desktop_double_click(lp: LPARAM) {
     let pt = POINT { x: loword(lp.0), y: hiword(lp.0) };
     let Some((d, m, hidden)) = with_app(|a| {
-        let busy = a.drag.is_some() || a.rename.is_some();
+        let busy = a.drag.is_some() || a.rename.is_some() || !a.state.double_click_hides;
         (!busy).then(|| Some((a.desktop.clone()?, a.metrics?, a.fade.hidden))).flatten()
     }) else {
         return;

@@ -3,6 +3,7 @@
 mod desktop;
 mod model;
 mod render;
+mod settings;
 mod store;
 mod theme;
 mod ui;

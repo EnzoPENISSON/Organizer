@@ -44,6 +44,8 @@ pub struct Desktop {
     items: Rc<RefCell<Items>>,
     reads: Rc<Cell<u32>>,
     direct_ok: Rc<Cell<bool>>,
+    /// The fast move has been checked against every icon since the handles were reloaded.
+    verified: Rc<Cell<bool>>,
 }
 
 /// Item ID list owned by this process, freed on drop.
@@ -74,7 +76,16 @@ impl Desktop {
             let folder: IShellFolder = view.GetFolder()?;
             let hwnd = shell_view.GetWindow()?;
             let list = FindWindowExW(Some(hwnd), None, w!("SysListView32"), None).unwrap_or_default();
-            Ok(Self { view, folder, hwnd, list, items: Rc::default(), reads: Rc::default(), direct_ok: Rc::new(Cell::new(true)) })
+            Ok(Self {
+                view,
+                folder,
+                hwnd,
+                list,
+                items: Rc::default(),
+                reads: Rc::default(),
+                direct_ok: Rc::new(Cell::new(true)),
+                verified: Rc::default(),
+            })
         }
     }
 
@@ -137,6 +148,7 @@ impl Desktop {
             Rc::new(items)
         };
         *self.items.borrow_mut() = items.clone();
+        self.verified.set(false);
         Ok(items)
     }
 
@@ -192,13 +204,21 @@ impl Desktop {
 
     /// Moves icons by messaging Explorer's list control, which repaints in about 6ms.
     /// The shell's own call takes about 250ms to show on screen, too slow to track a drag.
-    /// This relies on view order matching list order, so the result is read back through
-    /// the item's own handle. Returns false if that does not hold.
+    ///
+    /// The list control knows icons only by index, so this relies on its order matching
+    /// the view's, which a desktop refresh can break. A wrong index moves the wrong icon.
+    /// So every moved icon is read back through its own handle, and the first time after
+    /// the handles are reloaded, every other icon is checked too. If anything is off, the
+    /// fast path is switched off for good and the shell's call puts every icon right,
+    /// including bystanders that were moved by mistake. Returns false in that case.
     fn move_direct(&self, items: &Items, moves: &[Move]) -> bool {
         if !self.direct_ok.get() || self.list.is_invalid() {
             return false;
         }
-        let mut check = None;
+        let position = |i: usize| unsafe { self.view.GetItemPosition(items[i].1.0) }.ok();
+        let before: Option<Vec<Option<POINT>>> =
+            (!self.verified.get()).then(|| (0..items.len()).map(position).collect());
+        let mut sent_to = Vec::with_capacity(moves.len());
         for m in moves {
             let Some(index) = items.iter().position(|(key, _)| *key == m.key) else { continue };
             let lparam = (m.y as u16 as u32) << 16 | m.x as u16 as u32;
@@ -214,17 +234,34 @@ impl Desktop {
                 )
             };
             if sent.0 == 0 {
-                return false;
+                break;
             }
-            check.get_or_insert((index, m.x, m.y));
+            sent_to.push((index, m.x, m.y));
         }
-        let Some((index, x, y)) = check else { return true };
-        let matches = unsafe { self.view.GetItemPosition(items[index].1.0) }.is_ok_and(|p| p.x == x && p.y == y);
-        if !matches {
-            self.direct_ok.set(false);
-            crate::store::log("list order does not match view order, using the slower move");
+        let moved_right = sent_to.len() == moves.len()
+            && sent_to.iter().all(|&(i, x, y)| position(i).is_some_and(|p| p.x == x && p.y == y));
+        let bystanders: Vec<Move> = before
+            .iter()
+            .flat_map(|before| {
+                before.iter().enumerate().filter_map(|(i, was)| {
+                    let was = (*was)?;
+                    let intended = sent_to.iter().any(|&(s, _, _)| s == i);
+                    (!intended && position(i) != Some(was))
+                        .then(|| Move { key: items[i].0.clone(), x: was.x, y: was.y })
+                })
+            })
+            .collect();
+        if moved_right && bystanders.is_empty() {
+            self.verified.set(true);
+            return true;
         }
-        matches
+        self.direct_ok.set(false);
+        crate::store::log("list order does not match view order, using the slower move");
+        let repair: Vec<Move> = moves.iter().cloned().chain(bystanders).collect();
+        if let Err(e) = self.position_batch(items, &repair) {
+            crate::store::log(&format!("could not put icons back: {e}"));
+        }
+        false
     }
 
     /// Reloads names and handles, so positions are right for a whole drag.
@@ -243,6 +280,7 @@ impl Desktop {
 
     /// Moves are by name; a name no longer on the desktop is skipped. Ends with the shell's
     /// own call, so Explorer's view agrees with the list control and remembers the position.
+    /// The handles are fresh, so the fast move is checked against every icon here.
     pub fn apply(&self, moves: &[Move]) -> Result<()> {
         if moves.is_empty() {
             return Ok(());
@@ -251,6 +289,12 @@ impl Desktop {
         self.move_direct(&items, moves);
         self.position_batch(&items, moves)?;
         Ok(())
+    }
+
+    /// Reloads the desktop the way F5 does, so Explorer applies a changed setting such as
+    /// a hidden Recycle Bin. Icons keep their positions.
+    pub fn refresh_view(&self) -> Result<()> {
+        unsafe { self.view.cast::<IShellView>()?.Refresh() }
     }
 
     pub fn folder_flags(&self) -> Result<u32> {

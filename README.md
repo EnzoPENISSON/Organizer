@@ -30,6 +30,7 @@ renaming, right-clicking and dragging icons all work as usual.
 - **Desktop boxes:** group desktop icons into boxes, and drag icons in and out
 - **Roll-up boxes:** fold a box down to its title bar to tuck its icons away, and open it again in one click
 - **Hide the desktop:** double-click empty space to fade out every box and icon
+- **Hide the Recycle Bin:** one checkbox in Settings, no digging through Windows menus
 - **CSS themes:** change colors, borders, glow and fonts with a `theme.css` file
 - **Lightweight:** native Rust, about 2 MB of RAM, no browser engine
 - **Game friendly:** pauses itself while a fullscreen game runs
@@ -70,6 +71,9 @@ Organizer runs from the system tray (it may be under the `^` overflow arrow).
 | Delete a box | Right-click the title bar |
 | Change the color or design | Tray icon > **Customize design (theme.css)** |
 | Hide or show boxes and icons | Double-click empty desktop space, or tray icon > **Hide boxes and icons** |
+| Open the settings | Tray icon > **Settings...** |
+| Turn off hiding on double-click | Tray icon > **Settings...** > untick **Double-click the desktop to hide boxes and icons** |
+| Hide or show the Recycle Bin | Tray icon > **Settings...** > **Hide the Recycle Bin on the desktop**. This is the same switch as Windows' *Desktop icon settings* |
 | Prevent accidental moves | Tray icon > **Lock boxes** |
 | Start at login | Tray icon > **Start with Windows** |
 | Check for updates | Automatic twice a day, or tray icon > **Check for updates**. When a newer release is out, click the notification or **Install update**: the installer runs and Organizer restarts |

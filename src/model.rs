@@ -255,6 +255,12 @@ pub struct Outcome {
 /// an icon dragged out leaves its box, one dropped in joins (at the drop position), one
 /// dragged within its box is reordered, and deleted files drop out. A rolled-up box keeps
 /// its parked icons wherever they are, and takes icons dropped on its title bar.
+///
+/// A rolled-up box also keeps members missing from `icons`: while Explorer reloads the
+/// desktop (F5, or a setting that changes which icons it shows) the list is incomplete, and
+/// a member dropped then would stay parked, out of reach, with no box to bring it back.
+/// Members that really are gone drop out once the box opens. Any parked icon that no box
+/// owns is brought back to a free spot.
 pub fn reconcile(
     boxes: &mut [DesktopBox],
     icons: &[Icon],
@@ -267,10 +273,11 @@ pub fn reconcile(
     for b in boxes.iter_mut() {
         let (rect, collapsed, before) = (b.rect, b.collapsed, b.members.len());
         b.members.retain(|k| {
-            by_key.get(k.as_str()).is_some_and(|i| {
-                let (cx, cy) = m.center(i.x, i.y);
-                collapsed || rect.contains(cx, cy)
-            })
+            collapsed
+                || by_key.get(k.as_str()).is_some_and(|i| {
+                    let (cx, cy) = m.center(i.x, i.y);
+                    rect.contains(cx, cy)
+                })
         });
         out.changed |= b.members.len() != before;
     }
@@ -294,8 +301,7 @@ pub fn reconcile(
         // such as one just dropped on the title bar, go back to it.
         if b.collapsed {
             out.moves.extend(b.targets(m).into_iter().filter(|t| {
-                let icon = by_key[t.key.as_str()];
-                (icon.x, icon.y) != (t.x, t.y)
+                by_key.get(t.key.as_str()).is_some_and(|icon| (icon.x, icon.y) != (t.x, t.y))
             }));
             continue;
         }
@@ -336,7 +342,81 @@ pub fn reconcile(
             }
         }
     }
+
+    let owned: HashSet<&str> = boxes.iter().flat_map(|b| b.members.iter().map(String::as_str)).collect();
+    let mut taken: Vec<(i32, i32)> = icons.iter().filter(|i| !is_parked(i.x, i.y)).map(|i| (i.x, i.y)).collect();
+    for icon in icons.iter().filter(|i| is_parked(i.x, i.y) && !owned.contains(i.key.as_str())) {
+        let area = area_of(&Rect { x: 0, y: 0, w: 1, h: 1 });
+        if let Some((x, y)) = free_cell(&area, boxes, &taken, m) {
+            out.moves.push(Move { key: icon.key.clone(), x, y });
+            taken.push((x, y));
+        }
+    }
     out
+}
+
+/// True when most icons in open boxes are suddenly outside them at once. A person drags
+/// one icon or a handful; Explorer resetting its layout (some desktop reloads do) moves them
+/// all. Read as drags, a reset would empty the boxes.
+pub fn looks_like_reset(boxes: &[DesktopBox], icons: &[Icon], m: &Metrics) -> bool {
+    let by_key: HashMap<&str, &Icon> = icons.iter().map(|i| (i.key.as_str(), i)).collect();
+    let (mut present, mut outside) = (0, 0);
+    for b in boxes.iter().filter(|b| !b.collapsed) {
+        for icon in b.members.iter().filter_map(|k| by_key.get(k.as_str())) {
+            present += 1;
+            let (cx, cy) = m.center(icon.x, icon.y);
+            outside += usize::from(!b.rect.contains(cx, cy));
+        }
+    }
+    outside >= 3 && outside * 2 > present
+}
+
+/// Puts the desktop back as it was before Explorer reloaded it: every box's icons in their
+/// slots, and loose icons where `before` had them. Icons that are new since then stay where
+/// Explorer put them. Boxes keep their members.
+pub fn restore_layout(
+    boxes: &mut [DesktopBox],
+    before: &[Icon],
+    now: &[Icon],
+    m: &Metrics,
+    area_of: &dyn Fn(&Rect) -> Rect,
+) -> Vec<Move> {
+    let mut moves = place_members(boxes, m, area_of);
+    let owned: HashSet<&str> = boxes.iter().flat_map(|b| b.members.iter().map(String::as_str)).collect();
+    let was: HashMap<&str, &Icon> = before.iter().map(|i| (i.key.as_str(), i)).collect();
+    for icon in now.iter().filter(|i| !owned.contains(i.key.as_str())) {
+        if let Some(old) = was.get(icon.key.as_str()).filter(|old| (old.x, old.y) != (icon.x, icon.y)) {
+            moves.push(Move { key: icon.key.clone(), x: old.x, y: old.y });
+        }
+    }
+    moves
+}
+
+/// Far enough out to be one of ours: no real screen reaches this.
+fn is_parked(x: i32, y: i32) -> bool {
+    x >= PARKED.0 - 1000 && y >= PARKED.1 - 1000
+}
+
+/// The first grid cell, column by column from the top-left as Explorer arranges icons,
+/// that no box (open size) and no icon covers. Returns the icon position for that cell.
+fn free_cell(area: &Rect, boxes: &[DesktopBox], icons: &[(i32, i32)], m: &Metrics) -> Option<(i32, i32)> {
+    let (mut x, right, bottom) = (area.x, area.x + area.w, area.y + area.h);
+    while x + m.cell_w <= right {
+        let mut y = area.y;
+        while y + m.cell_h <= bottom {
+            let cell = Rect { x, y, w: m.cell_w, h: m.cell_h };
+            let free = boxes.iter().all(|b| !cell.intersects(&b.rect))
+                && icons.iter().all(|&(ix, iy)| {
+                    !cell.intersects(&Rect { x: ix - m.icon_x, y: iy - m.icon_y, w: m.cell_w, h: m.cell_h })
+                });
+            if free {
+                return Some((x + m.icon_x, y + m.icon_y));
+            }
+            y += m.cell_h;
+        }
+        x += m.cell_w;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -569,6 +649,67 @@ mod tests {
             Move { key: "b".into(), x: slot(&bs[0], 1).0, y: slot(&bs[0], 1).1 },
         ]);
         assert!(bs[0].collapsed);
+    }
+
+    #[test]
+    fn rolled_up_box_keeps_members_missing_while_explorer_reloads() {
+        let mut bs = [rolled_up(&["a", "b"])];
+        // Mid-refresh, only some icons are listed so far.
+        let o = reconcile(&mut bs, &[icon("a", PARKED)], &M, &area);
+        assert_eq!(members(&bs[0]), ["a", "b"]);
+        assert!(o.moves.is_empty());
+        // Once "b" is listed again, wherever Explorer put it, it goes back to the box.
+        let o = reconcile(&mut bs, &[icon("a", PARKED), icon("b", (0, 0))], &M, &area);
+        assert_eq!(o.moves, [Move { key: "b".into(), x: PARKED.0, y: PARKED.1 }]);
+    }
+
+    #[test]
+    fn missing_members_of_a_reopened_box_drop_out() {
+        let mut bs = [rolled_up(&["a", "gone"])];
+        bs[0].collapsed = false;
+        let icons = [icon("a", slot(&bs[0], 0))];
+        reconcile(&mut bs, &icons, &M, &area);
+        assert_eq!(members(&bs[0]), ["a"]);
+    }
+
+    #[test]
+    fn parked_icon_with_no_box_comes_back_to_a_free_spot() {
+        let mut bs = [make_box(&[])];
+        bs[0].rect = Rect { x: 0, y: 0, w: 320, h: 400 }; // covers the first column
+        let icons = [icon("lost", PARKED), icon("other", (400, 0))];
+        let o = reconcile(&mut bs, &icons, &M, &area);
+        assert_eq!(o.moves.len(), 1, "{:?}", o.moves);
+        let back = &o.moves[0];
+        assert_eq!(back.key, "lost");
+        let cell = Rect { x: back.x, y: back.y, w: M.cell_w, h: M.cell_h };
+        assert!(!cell.intersects(&bs[0].rect), "not under a box: {back:?}");
+        assert!(!cell.intersects(&Rect { x: 400, y: 0, w: M.cell_w, h: M.cell_h }), "not on another icon: {back:?}");
+        assert!(AREA.contains(back.x, back.y));
+    }
+
+    #[test]
+    fn explorer_resetting_the_layout_is_not_read_as_drags() {
+        let bs = [make_box(&["a", "b", "c", "d"])];
+        // Explorer's default layout: a column down the left, far from the box.
+        let reset: Vec<_> = ["a", "b", "c", "d"].iter().enumerate().map(|(i, k)| icon(k, (1500, i as i32 * 100))).collect();
+        assert!(looks_like_reset(&bs, &reset, &M));
+        // Dragging one icon out is a drag.
+        let one_out = [icon("a", (1500, 800)), icon("b", slot(&bs[0], 1)), icon("c", slot(&bs[0], 2)), icon("d", slot(&bs[0], 3))];
+        assert!(!looks_like_reset(&bs, &one_out, &M));
+    }
+
+    #[test]
+    fn restoring_after_a_reload_puts_boxed_and_loose_icons_back() {
+        let mut bs = [make_box(&["a", "b"])];
+        let before = [icon("a", slot(&bs[0], 0)), icon("b", slot(&bs[0], 1)), icon("loose", (1500, 800))];
+        let now = [icon("a", (0, 0)), icon("b", (0, 100)), icon("loose", (0, 200)), icon("new", (0, 300))];
+        let moves = restore_layout(&mut bs, &before, &now, &M, &area);
+        let to = |k: &str| moves.iter().find(|m| m.key == k).map(|m| (m.x, m.y));
+        assert_eq!(to("a"), Some(slot(&bs[0], 0)));
+        assert_eq!(to("b"), Some(slot(&bs[0], 1)));
+        assert_eq!(to("loose"), Some((1500, 800)));
+        assert_eq!(to("new"), None, "an icon Explorer just added stays where it is");
+        assert_eq!(members(&bs[0]), ["a", "b"]);
     }
 
     #[test]

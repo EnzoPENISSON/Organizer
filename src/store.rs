@@ -4,11 +4,25 @@ use crate::{model::DesktopBox, theme::{self, Theme}};
 use serde::{Deserialize, Serialize};
 use std::{fs, io::Write, path::PathBuf, time::SystemTime};
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct State {
     pub next_id: u64,
     pub locked: bool,
+    /// Double-clicking empty desktop space hides the boxes and icons. On unless turned off,
+    /// including for files saved before the setting existed.
+    #[serde(default = "on")]
+    pub double_click_hides: bool,
     pub boxes: Vec<DesktopBox>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self { next_id: 0, locked: false, double_click_hides: true, boxes: Vec::new() }
+    }
+}
+
+fn on() -> bool {
+    true
 }
 
 /// The layout as it was before Organizer first changed anything.
@@ -106,5 +120,17 @@ pub fn delete_snapshot() {
 pub fn log(message: &str) {
     if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(dir().join("organizer.log")) {
         let _ = writeln!(f, "{message}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn files_saved_before_the_double_click_setting_keep_it_on() {
+        let state: State = serde_json::from_str(r#"{"next_id":0,"locked":false,"boxes":[]}"#).unwrap();
+        assert!(state.double_click_hides);
+        assert!(State::default().double_click_hides);
     }
 }
