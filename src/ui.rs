@@ -15,7 +15,7 @@ use crate::{
     model::{self, DesktopBox, Edges, Metrics, Rect},
     render::{self, Layer, Sizes},
     store::{self, Snapshot, State},
-    theme::{Align, Rgba, Theme},
+    theme::{Align, Theme},
 };
 use std::{cell::RefCell, collections::HashMap, rc::Rc, time::SystemTime};
 use windows::{
@@ -49,6 +49,8 @@ const TINT_CLASS: PCWSTR = w!("OrganizerBoxTint");
 const HOST_CLASS: PCWSTR = w!("OrganizerHost");
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_FOLLOW: u32 = WM_APP + 2;
+/// Posted by `organizer.exe new` to the running instance.
+const WM_NEW_BOX: u32 = WM_APP + 3;
 const EM_SETSEL: u32 = 0x00B1;
 const POLL_TIMER: usize = 1;
 const POLL_MS: u32 = 1000;
@@ -57,17 +59,9 @@ const TICKS_PER_TRIM: u32 = 30;
 const TICKS_PER_FULL_CHECK: u32 = 30;
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 const RUN_VALUE: PCWSTR = w!("Organizer");
-
-const COLORS: [(&str, u32); 8] = [
-    ("Cyan", 0x00E5FF),
-    ("Violet", 0xA855F7),
-    ("Magenta", 0xFF2E93),
-    ("Lime", 0x7CFF4F),
-    ("Amber", 0xFFB020),
-    ("Red", 0xFF4655),
-    ("Ice", 0xE6EDF7),
-    ("Graphite", 0x3B4252),
-];
+/// The desktop background's right-click menu. On Windows 11 it is under "Show more options".
+const MENU_KEY: PCWSTR = w!("Software\\Classes\\DesktopBackground\\Shell\\OrganizerNewBox");
+const MENU_COMMAND_KEY: PCWSTR = w!("Software\\Classes\\DesktopBackground\\Shell\\OrganizerNewBox\\command");
 
 const CMD_NEW: usize = 1;
 const CMD_LOCK: usize = 2;
@@ -77,7 +71,6 @@ const CMD_EXIT: usize = 5;
 const CMD_THEME: usize = 6;
 const CMD_RENAME: usize = 10;
 const CMD_DELETE: usize = 11;
-const CMD_COLOR: usize = 20;
 
 struct Drag {
     id: u64,
@@ -140,7 +133,17 @@ fn save() {
     with_app(|a| store::save(&a.state));
 }
 
-pub fn run() {
+/// Asks an already running Organizer to create a box. False if none is running.
+pub fn request_new_box() -> bool {
+    unsafe {
+        match FindWindowW(HOST_CLASS, None) {
+            Ok(host) if !host.is_invalid() => PostMessageW(Some(host), WM_NEW_BOX, WPARAM(0), LPARAM(0)).is_ok(),
+            _ => false,
+        }
+    }
+}
+
+pub fn run(start_with_new_box: bool) {
     unsafe {
         // Two instances would fight over the same icons.
         let mutex = CreateMutexW(None, false, w!("Local\\OrganizerDesktopBoxes.v2"));
@@ -183,7 +186,11 @@ pub fn run() {
             a.tray_icon = icon;
         });
         add_tray_icon();
+        register_desktop_menu();
         connect();
+        if start_with_new_box {
+            new_box();
+        }
         SetTimer(Some(host), POLL_TIMER, POLL_MS, None);
 
         let mut msg = MSG::default();
@@ -193,8 +200,15 @@ pub fn run() {
         }
 
         remove_tray_icon();
+        unregister_desktop_menu();
         destroy_box_windows();
         save();
+        let _ = DestroyWindow(host);
+        // Release Explorer's COM objects now, while COM still runs. Left in the thread-local
+        // `APP`, they would be released during process teardown and Explorer would keep this
+        // process alive, as an unkillable zombie, until Explorer itself restarts.
+        let app = with_app(std::mem::take);
+        drop(app);
         drop(mutex);
     }
 }
@@ -283,17 +297,49 @@ fn set_autostart(enable: bool) {
             return;
         }
         if enable {
-            let exe = std::env::current_exe().unwrap_or_default();
-            let data: Vec<u8> = format!("\"{}\"", exe.display())
-                .encode_utf16()
-                .chain([0])
-                .flat_map(u16::to_le_bytes)
-                .collect();
-            let _ = RegSetValueExW(key, RUN_VALUE, None, REG_SZ, Some(&data));
+            let _ = RegSetValueExW(key, RUN_VALUE, None, REG_SZ, Some(&reg_sz(&exe_command(""))));
         } else {
             let _ = RegDeleteValueW(key, RUN_VALUE);
         }
         let _ = RegCloseKey(key);
+    }
+}
+
+/// This exe, quoted, followed by `args`.
+fn exe_command(args: &str) -> String {
+    let exe = std::env::current_exe().unwrap_or_default();
+    format!("\"{}\"{}{}", exe.display(), if args.is_empty() { "" } else { " " }, args)
+}
+
+/// A REG_SZ value: UTF-16 with a terminating null.
+fn reg_sz(text: &str) -> Vec<u8> {
+    text.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect()
+}
+
+fn set_default_value(subkey: PCWSTR, text: &str) -> bool {
+    unsafe {
+        let mut key = HKEY::default();
+        let created = RegCreateKeyExW(HKEY_CURRENT_USER, subkey, None, None, REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, None, &mut key, None);
+        if created.is_err() {
+            return false;
+        }
+        let ok = RegSetValueExW(key, None, None, REG_SZ, Some(&reg_sz(text))).is_ok();
+        let _ = RegCloseKey(key);
+        ok
+    }
+}
+
+/// Adds "New box" to the desktop's right-click menu. Rewritten at every start, so the
+/// command follows the exe if it moves.
+fn register_desktop_menu() {
+    if !(set_default_value(MENU_KEY, "New box") && set_default_value(MENU_COMMAND_KEY, &exe_command("new"))) {
+        store::log("could not add New box to the desktop menu");
+    }
+}
+
+fn unregister_desktop_menu() {
+    unsafe {
+        let _ = RegDeleteTreeW(HKEY_CURRENT_USER, MENU_KEY);
     }
 }
 
@@ -356,28 +402,18 @@ fn open_theme() {
 
 fn show_box_menu(id: u64) {
     unsafe {
-        let Some(b) = find_box(id) else { return };
-        let (Ok(menu), Ok(colors)) = (CreatePopupMenu(), CreatePopupMenu()) else { return };
-        for (i, (name, rgb)) in COLORS.iter().enumerate() {
-            let flags = if *rgb == b.color { MF_STRING | MF_CHECKED } else { MF_STRING };
-            let _ = AppendMenuW(colors, flags, CMD_COLOR + i, &HSTRING::from(*name));
+        if find_box(id).is_none() {
+            return;
         }
+        let Ok(menu) = CreatePopupMenu() else { return };
+        let _ = AppendMenuW(menu, MF_STRING, CMD_NEW, w!("New box"));
         let _ = AppendMenuW(menu, MF_STRING, CMD_RENAME, w!("Rename"));
-        let _ = AppendMenuW(menu, MF_STRING | MF_POPUP, colors.0 as usize, w!("Color"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let _ = AppendMenuW(menu, MF_STRING, CMD_DELETE, w!("Delete box (icons stay on the desktop)"));
         match track_menu(menu) {
+            CMD_NEW => new_box(),
             CMD_RENAME => begin_rename(id),
             CMD_DELETE => delete_box(id),
-            c if (CMD_COLOR..CMD_COLOR + COLORS.len()).contains(&c) => {
-                with_app(|a| {
-                    if let Some(b) = a.state.boxes.iter_mut().find(|b| b.id == id) {
-                        b.color = COLORS[c - CMD_COLOR].1;
-                    }
-                });
-                save();
-                repaint(id);
-            }
             _ => {}
         }
     }
@@ -633,11 +669,9 @@ fn new_box() {
         let rect = model::free_spot(&area, width, height, &icons, &a.state.boxes, &m);
         a.state.next_id += 1;
         let id = a.state.next_id;
-        let n = a.state.boxes.len();
         a.state.boxes.push(DesktopBox {
             id,
             name: format!("Box {}", id),
-            color: COLORS[n % COLORS.len()].1,
             rect,
             members: Vec::new(),
         });
@@ -879,7 +913,7 @@ fn repaint(id: u64) {
         return;
     };
     let s = sizes(&t, &m, view);
-    let accent = Rgba::from_rgb24(b.color);
+    let accent = t.accent;
     let (w, h) = (b.rect.w, b.rect.h);
 
     let mut top = render::frame_layer(&t, &s, accent, w, h);
@@ -1127,6 +1161,7 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
     match msg {
         WM_TIMER if wp.0 == POLL_TIMER => poll(),
         WM_FOLLOW => follow_icons(),
+        WM_NEW_BOX => new_box(),
         WM_TRAY if matches!(lp.0 as u32, WM_LBUTTONUP | WM_RBUTTONUP) => show_tray_menu(),
         WM_DISPLAYCHANGE => place_all(),
         WM_DESTROY => unsafe { PostQuitMessage(0) },

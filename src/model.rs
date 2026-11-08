@@ -24,8 +24,6 @@ impl Rect {
 pub struct DesktopBox {
     pub id: u64,
     pub name: String,
-    /// 0xRRGGBB
-    pub color: u32,
     pub rect: Rect,
     /// Shell parsing names of the icons in this box, in display order.
     pub members: Vec<String>,
@@ -294,7 +292,6 @@ mod tests {
         DesktopBox {
             id: 1,
             name: "t".into(),
-            color: 0,
             rect: Rect { x: 100, y: 100, w: 320, h: 400 },
             members: members.iter().map(|s| s.to_string()).collect(),
         }

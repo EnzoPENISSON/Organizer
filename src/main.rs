@@ -8,7 +8,7 @@ mod theme;
 mod ui;
 
 use windows::Win32::System::{
-    Com::{COINIT_APARTMENTTHREADED, CoInitializeEx},
+    Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize},
     Console::{ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_OUTPUT_HANDLE},
 };
 
@@ -21,7 +21,13 @@ fn main() {
         }
         return list();
     }
-    ui::run();
+    // Sent by the desktop's right-click menu entry.
+    let new_box = std::env::args().nth(1).as_deref() == Some("new");
+    if new_box && ui::request_new_box() {
+        return;
+    }
+    ui::run(new_box);
+    unsafe { CoUninitialize() };
 }
 
 /// Read-only diagnostic: prints what Organizer can see, and changes nothing.

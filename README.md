@@ -20,15 +20,15 @@ Organizer runs from the system tray (it may be under the `^` overflow arrow).
 
 | To | Do this |
 | --- | --- |
-| Create a box | Tray icon > **New box** |
+| Create a box | Tray icon > **New box**, right-click a box's title bar > **New box**, or right-click the desktop > **New box** (on Windows 11, under **Show more options**) |
 | Add an icon | Drag it into a box |
 | Remove an icon | Drag it out of the box |
 | Reorder icons | Drag an icon within its box |
 | Move a box (its icons follow) | Drag the title bar |
 | Resize a box | Drag the left, right or bottom edge |
 | Rename a box | Double-click the title bar |
-| Change color or delete a box | Right-click the title bar |
-| Change the design | Tray icon > **Customize design (theme.css)** |
+| Delete a box | Right-click the title bar |
+| Change the color or design | Tray icon > **Customize design (theme.css)** |
 | Prevent accidental moves | Tray icon > **Lock boxes** |
 | Start at login | Tray icon > **Start with Windows** |
 | Undo everything | Tray icon > **Remove all boxes and restore original layout...** |
@@ -42,10 +42,12 @@ Open `theme.css` from the tray menu. Save it and your boxes update within a seco
 never breaks anything: the bad line is ignored and noted in `organizer.log`. Delete the file to
 get the default back.
 
-`var(--accent)` is each box's own color, chosen from its right-click menu.
+The box color is `--accent` in `:root`, used anywhere with `var(--accent)`. It defaults to
+graphite (`#3B4252`) and applies to every box.
 
 ```css
 :root {
+  --accent: #3B4252;
   --panel: rgba(10, 12, 20, 0.85);
 }
 
@@ -78,7 +80,7 @@ memory. These are all the supported features:
 
 | Selector | Properties |
 | --- | --- |
-| `:root` | `--your-variables`, used with `var(--name)` |
+| `:root` | `--accent` (the box color), and `--your-variables`, used with `var(--name)` |
 | `.box` | `background`, `border`, `border-width`, `border-color`, `border-radius`, `box-shadow`, `padding` |
 | `.title` | `height`, `background`, `color`, `font-family`, `font-size`, `font-weight`, `text-align`, `text-transform`, `letter-spacing`, `padding` |
 

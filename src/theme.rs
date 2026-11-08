@@ -4,10 +4,13 @@
 
 use std::collections::HashMap;
 
+/// Graphite, used when `theme.css` does not set `--accent`.
+pub const DEFAULT_ACCENT: u32 = 0x3B4252;
+
 pub const DEFAULT_CSS: &str = r#"/* Organizer theme — "Frosted Glass". Save this file and your boxes update within a second.
 
    This is a focused subset of CSS, not a browser. Selectors: :root, .box, .title
-   var(--accent) is each box's color, chosen from its right-click menu.
+   var(--accent) is the box color, set with --accent in :root below.
 
    .box:    background, border, border-width, border-color, border-radius,
             box-shadow, padding
@@ -24,6 +27,7 @@ pub const DEFAULT_CSS: &str = r#"/* Organizer theme — "Frosted Glass". Save th
 
 :root {
   /* Shared palette — tweak these to restyle every box at once. */
+  --accent:   #3B4252;                  /* box color (graphite)   */
   --ink:      rgba(12, 14, 22, 0.55);   /* dark glass base        */
   --ink-deep: rgba(12, 14, 22, 0.82);   /* title bar base         */
   --frost:    rgba(255, 255, 255, 0.06);/* light sheen            */
@@ -127,6 +131,8 @@ pub enum Fill {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Theme {
+    /// `--accent` from `:root`, shared by every box.
+    pub accent: Rgba,
     pub background: Fill,
     pub border_width: f32,
     pub border_color: Paint,
@@ -156,6 +162,7 @@ pub enum Align {
 impl Default for Theme {
     fn default() -> Self {
         let fallback = Theme {
+            accent: Rgba::from_rgb24(DEFAULT_ACCENT),
             background: Fill::Solid(Paint::Color(Rgba::TRANSPARENT)),
             border_width: 1.0,
             border_color: Paint::Accent,
@@ -195,6 +202,16 @@ pub fn parse(css: &str, base: Theme) -> (Theme, Vec<String>) {
                     warnings.push(format!(":root: only --variables are supported, ignored {prop}"));
                 }
             }
+        }
+    }
+
+    // `--accent` becomes the theme's accent instead of being substituted, so
+    // `var(--accent)` keeps meaning "the accent" everywhere.
+    if let Some(value) = vars.remove("--accent") {
+        let value = substitute_vars(&value, &vars);
+        match parse_paint(&value) {
+            Some(p) => theme.accent = p.resolve(theme.accent),
+            None => warnings.push(format!(":root: ignored `--accent: {value}`")),
         }
     }
 
@@ -532,6 +549,15 @@ mod tests {
         let (t, w) = parse(css, Theme::default());
         assert!(w.is_empty(), "{w:?}");
         assert_eq!(t.border_color, Paint::Color(Rgba::from_rgb24(0x00FF00)));
+    }
+
+    #[test]
+    fn accent_defaults_to_graphite_and_is_set_from_root() {
+        assert_eq!(Theme::default().accent, Rgba::from_rgb24(DEFAULT_ACCENT));
+        let (t, w) = parse(":root { --cyan: #00e5ff; --accent: var(--cyan); } .box { border-color: var(--accent); }", Theme::default());
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(t.accent, Rgba::from_rgb24(0x00E5FF));
+        assert_eq!(t.border_color, Paint::Accent);
     }
 
     #[test]
