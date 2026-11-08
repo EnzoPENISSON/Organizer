@@ -22,6 +22,11 @@ fn main() {
         }
         return list();
     }
+    // Sent by the installer and uninstaller before they replace or remove the exe.
+    if std::env::args().nth(1).as_deref() == Some("exit") {
+        ui::request_exit();
+        return;
+    }
     // Sent by the desktop's right-click menu entry.
     let new_box = std::env::args().nth(1).as_deref() == Some("new");
     if new_box && ui::request_new_box() {

@@ -7,12 +7,21 @@ entirely while a fullscreen game runs.
 Your files never move. Boxes only control where the real desktop icons sit, so opening,
 renaming, right-clicking and dragging icons all work as usual.
 
-## Run
+## Install
+
+Download `Organizer-Setup-….exe` from the latest
+[release](https://github.com/EnzoPENISSON/Organizer/releases/latest) and run it. It installs
+for your account only (no admin rights) and can be removed from Settings > Apps.
+
+## Build from source
 
 ```
 cargo build --release
 target\release\organizer.exe
 ```
+
+To build the installer too, install [Inno Setup 6](https://jrsoftware.org/isinfo.php) and run
+`ISCC.exe installer\organizer.iss`.
 
 Organizer runs from the system tray (it may be under the `^` overflow arrow).
 
@@ -31,7 +40,7 @@ Organizer runs from the system tray (it may be under the `^` overflow arrow).
 | Change the color or design | Tray icon > **Customize design (theme.css)** |
 | Prevent accidental moves | Tray icon > **Lock boxes** |
 | Start at login | Tray icon > **Start with Windows** |
-| Check for updates | Automatic twice a day, or tray icon > **Check for updates**. A notification appears when a newer release is out |
+| Check for updates | Automatic twice a day, or tray icon > **Check for updates**. When a newer release is out, click the notification or **Install update**: the installer runs and Organizer restarts |
 | Undo everything | Tray icon > **Remove all boxes and restore original layout...** |
 
 Deleting a box leaves its icons where they are. Moving a box over loose icons adds them to it.

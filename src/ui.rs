@@ -26,7 +26,10 @@ use windows::{
         System::{
             LibraryLoader::GetModuleHandleW,
             Registry::*,
-            Threading::{CreateMutexW, GetCurrentProcess, SetProcessWorkingSetSize},
+            Threading::{
+                CreateMutexW, GetCurrentProcess, OpenProcess, PROCESS_SYNCHRONIZE, SetProcessWorkingSetSize,
+                WaitForSingleObject,
+            },
         },
         UI::{
             HiDpi::GetDpiForWindow,
@@ -55,6 +58,10 @@ const WM_FOLLOW: u32 = WM_APP + 2;
 const WM_NEW_BOX: u32 = WM_APP + 3;
 /// Posted by the update check's thread when it is done. See `update::check_async`.
 const WM_UPDATE: u32 = WM_APP + 4;
+/// Posted by `organizer.exe exit` (the installer and uninstaller).
+const WM_EXIT: u32 = WM_APP + 5;
+/// Posted when the update installer has been downloaded. See `update::download_async`.
+const WM_UPDATE_DOWNLOADED: u32 = WM_APP + 6;
 const UPDATE_TIMER: usize = 2;
 /// The first check waits a minute so it never competes with startup work.
 const UPDATE_FIRST_MS: u32 = 60 * 1000;
@@ -78,7 +85,7 @@ const CMD_RESTORE: usize = 4;
 const CMD_EXIT: usize = 5;
 const CMD_THEME: usize = 6;
 const CMD_CHECK_UPDATE: usize = 7;
-const CMD_DOWNLOAD_UPDATE: usize = 8;
+const CMD_INSTALL_UPDATE: usize = 8;
 const CMD_RENAME: usize = 10;
 const CMD_DELETE: usize = 11;
 
@@ -115,9 +122,10 @@ struct App {
     theme_stamp: Option<SystemTime>,
     rendered_size: HashMap<u64, (i32, i32)>,
     follow_pending: bool,
-    /// Tag and page of a newer release, once a check has found one.
-    update: Option<(String, String)>,
+    /// A newer release, once a check has found one.
+    update: Option<update::Release>,
     checking_update: bool,
+    downloading_update: bool,
 }
 
 thread_local! {
@@ -144,6 +152,23 @@ fn find_box(id: u64) -> Option<DesktopBox> {
 
 fn save() {
     with_app(|a| store::save(&a.state));
+}
+
+/// Asks a running Organizer to quit and waits up to 10 seconds for it to finish, so its
+/// files can be replaced. Used by the installer and uninstaller: `organizer.exe exit`.
+pub fn request_exit() {
+    unsafe {
+        let Ok(host) = FindWindowW(HOST_CLASS, None) else { return };
+        let mut pid = 0;
+        GetWindowThreadProcessId(host, Some(&mut pid));
+        let process = OpenProcess(PROCESS_SYNCHRONIZE, false, pid);
+        if PostMessageW(Some(host), WM_EXIT, WPARAM(0), LPARAM(0)).is_ok() {
+            if let Ok(process) = process {
+                WaitForSingleObject(process, 10_000);
+                let _ = CloseHandle(process);
+            }
+        }
+    }
 }
 
 /// Asks an already running Organizer to create a box. False if none is running.
@@ -293,12 +318,13 @@ fn start_update_check(manual: bool) {
 fn on_update_checked(manual: bool, outcome: update::Outcome) {
     with_app(|a| a.checking_update = false);
     match outcome {
-        update::Outcome::Newer { tag, url } => {
-            let seen = with_app(|a| a.update.as_ref().is_some_and(|(t, _)| *t == tag));
+        update::Outcome::Newer(release) => {
+            let seen = with_app(|a| a.update.as_ref().is_some_and(|r| r.tag == release.tag));
             if manual || !seen {
-                notify("Organizer update available", &format!("{tag} is available. Click to open the download page."));
+                let action = if release.installer.is_some() { "install it" } else { "open the download page" };
+                notify("Organizer update available", &format!("{} is available. Click to {action}.", release.tag));
             }
-            with_app(|a| a.update = Some((tag, url)));
+            with_app(|a| a.update = Some(release));
         }
         update::Outcome::UpToDate => {
             if manual {
@@ -314,10 +340,42 @@ fn on_update_checked(manual: bool, outcome: update::Outcome) {
     }
 }
 
-fn open_update_page() {
-    if let Some((_, url)) = with_app(|a| a.update.clone()) {
-        unsafe {
-            ShellExecuteW(None, w!("open"), &HSTRING::from(url), None, None, SW_SHOWNORMAL);
+/// Downloads the new release's installer, or opens its page if it has none.
+fn install_update() {
+    let Some(release) = with_app(|a| a.update.clone()) else { return };
+    if with_app(|a| a.downloading_update) {
+        return;
+    }
+    let host = with_app(|a| a.host);
+    if update::download_async(host, WM_UPDATE_DOWNLOADED, &release) {
+        with_app(|a| a.downloading_update = true);
+        notify("Downloading Organizer update", &format!("{} will install in a moment.", release.tag));
+    } else {
+        open_update_page(&release);
+    }
+}
+
+fn open_update_page(release: &update::Release) {
+    unsafe {
+        ShellExecuteW(None, w!("open"), &HSTRING::from(release.page.as_str()), None, None, SW_SHOWNORMAL);
+    }
+}
+
+/// Runs the downloaded installer and quits so it can replace the exe. `/SILENT` shows its
+/// progress but asks nothing, and it restarts Organizer when done (see installer/organizer.iss).
+fn on_update_downloaded(result: Result<std::path::PathBuf, String>) {
+    with_app(|a| a.downloading_update = false);
+    let started = result.and_then(|path| unsafe {
+        let args = w!("/SILENT /SUPPRESSMSGBOXES /NORESTART");
+        let run = ShellExecuteW(None, w!("open"), &HSTRING::from(path.as_os_str()), args, None, SW_SHOWNORMAL);
+        // Values of 32 or less are errors.
+        if run.0 as isize > 32 { Ok(()) } else { Err(format!("could not start the installer (error {})", run.0 as isize)) }
+    });
+    match started {
+        Ok(()) => unsafe { PostQuitMessage(0) },
+        Err(e) => {
+            store::log(&format!("update failed: {e}"));
+            notify("Could not install the update", &e);
         }
     }
 }
@@ -420,9 +478,17 @@ fn show_tray_menu() {
         let _ = AppendMenuW(menu, MF_STRING, CMD_RESTORE, w!("Remove all boxes and restore original layout..."));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, &HSTRING::from(update::label()));
-        if let Some((tag, _)) = with_app(|a| a.update.clone()) {
-            let item = HSTRING::from(format!("Download update {tag}"));
-            let _ = AppendMenuW(menu, MF_STRING, CMD_DOWNLOAD_UPDATE, &item);
+        if let Some(release) = with_app(|a| a.update.clone()) {
+            let downloading = with_app(|a| a.downloading_update);
+            let item = HSTRING::from(if downloading {
+                format!("Downloading update {}...", release.tag)
+            } else if release.installer.is_some() {
+                format!("Install update {}", release.tag)
+            } else {
+                format!("Download update {}", release.tag)
+            });
+            let flags = MF_STRING | if downloading { MF_GRAYED } else { MF_ENABLED };
+            let _ = AppendMenuW(menu, flags, CMD_INSTALL_UPDATE, &item);
         }
         let checking = with_app(|a| a.checking_update);
         let label = if checking { w!("Checking for updates...") } else { w!("Check for updates") };
@@ -439,7 +505,7 @@ fn show_tray_menu() {
             CMD_AUTOSTART => set_autostart(!autostart_enabled()),
             CMD_RESTORE => restore_original(),
             CMD_CHECK_UPDATE => start_update_check(true),
-            CMD_DOWNLOAD_UPDATE => open_update_page(),
+            CMD_INSTALL_UPDATE => install_update(),
             CMD_EXIT => PostQuitMessage(0),
             _ => {}
         }
@@ -1226,10 +1292,12 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             start_update_check(false);
         }
         WM_UPDATE => on_update_checked(wp.0 != 0, unsafe { update::take(lp) }),
+        WM_UPDATE_DOWNLOADED => on_update_downloaded(unsafe { update::take(lp) }),
+        WM_EXIT => unsafe { PostQuitMessage(0) },
         WM_FOLLOW => follow_icons(),
         WM_NEW_BOX => new_box(),
         WM_TRAY if matches!(lp.0 as u32, WM_LBUTTONUP | WM_RBUTTONUP) => show_tray_menu(),
-        WM_TRAY if lp.0 as u32 == NIN_BALLOONUSERCLICK => open_update_page(),
+        WM_TRAY if lp.0 as u32 == NIN_BALLOONUSERCLICK => install_update(),
         WM_DISPLAYCHANGE => place_all(),
         WM_DESTROY => unsafe { PostQuitMessage(0) },
         _ => return unsafe { DefWindowProcW(hwnd, msg, wp, lp) },

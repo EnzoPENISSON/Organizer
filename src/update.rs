@@ -1,26 +1,31 @@
-//! Checks GitHub for a newer release than the running exe.
+//! Checks GitHub for a newer release than the running exe, and downloads its installer.
 //!
 //! Kept cheap on purpose: one small HTTPS request through Windows' own WinHTTP (no extra
 //! crates), made on a short-lived thread that exits right after, a minute after start and
 //! then twice a day. Nothing runs between checks, and a failed check just waits for the next.
+//! The installer (a few MB) is only downloaded when the user chooses to install.
 
 use serde::Deserialize;
-use std::ffi::c_void;
+use std::{ffi::c_void, path::PathBuf};
 use windows::{
     Win32::{
         Foundation::{HWND, LPARAM, WPARAM},
         Networking::WinHttp::*,
         UI::WindowsAndMessaging::PostMessageW,
     },
-    core::{PCWSTR, w},
+    core::{HSTRING, PCWSTR, w},
 };
 
-const API_HOST: PCWSTR = w!("api.github.com");
-const LATEST_PATH: PCWSTR = w!("/repos/EnzoPENISSON/Organizer/releases/latest");
+const API_HOST: &str = "api.github.com";
+const LATEST_PATH: &str = "/repos/EnzoPENISSON/Organizer/releases/latest";
 const USER_AGENT: PCWSTR = w!("Organizer-update-check");
-/// Where the download link may point. Anything else falls back to the releases page.
+/// Links from GitHub's answer are only followed inside this repo's releases.
 const RELEASES_URL: &str = "https://github.com/EnzoPENISSON/Organizer/releases";
-const MAX_RESPONSE: usize = 1 << 20;
+const DOWNLOAD_URL: &str = "https://github.com/EnzoPENISSON/Organizer/releases/download/";
+/// Release asset names: `Organizer-Setup-<tag>.exe` (see installer/organizer.iss).
+const INSTALLER_PREFIX: &str = "Organizer-Setup-";
+const MAX_ANSWER: usize = 1 << 20;
+const MAX_INSTALLER: usize = 64 << 20;
 
 /// The CI run number (see build.rs and the release workflow). Absent in local builds.
 const BUILD: Option<&str> = option_env!("ORGANIZER_BUILD");
@@ -59,56 +64,74 @@ pub fn parse_tag(tag: &str) -> Option<Version> {
     parts.next().is_none().then_some(v)
 }
 
+/// A newer release than the running exe.
+#[derive(Clone)]
+pub struct Release {
+    pub tag: String,
+    /// The release's web page.
+    pub page: String,
+    /// Download link of its installer, if the release has one.
+    pub installer: Option<String>,
+}
+
 pub enum Outcome {
-    Newer { tag: String, url: String },
+    Newer(Release),
     UpToDate,
     Failed(String),
 }
 
 #[derive(Deserialize)]
-struct Release {
+struct Answer {
     tag_name: String,
     html_url: String,
+    #[serde(default)]
+    assets: Vec<Asset>,
+}
+
+#[derive(Deserialize)]
+struct Asset {
+    name: String,
+    browser_download_url: String,
 }
 
 /// Compares GitHub's "latest release" answer with `current`.
 fn outcome(json: &[u8], current: Version) -> Outcome {
-    let release: Release = match serde_json::from_slice(json) {
-        Ok(r) => r,
+    let answer: Answer = match serde_json::from_slice(json) {
+        Ok(a) => a,
         Err(e) => return Outcome::Failed(format!("unexpected answer from GitHub: {e}")),
     };
-    match parse_tag(&release.tag_name) {
+    match parse_tag(&answer.tag_name) {
         Some(latest) if latest > current => {
-            // The link is opened with the shell, so only ever follow it to this repo's releases.
-            let url = if release.html_url.starts_with(&format!("{RELEASES_URL}/")) {
-                release.html_url
+            // These links are opened or downloaded, so only ever follow them into this repo.
+            let page = if answer.html_url.starts_with(&format!("{RELEASES_URL}/")) {
+                answer.html_url
             } else {
                 RELEASES_URL.to_string()
             };
-            Outcome::Newer { tag: release.tag_name, url }
+            let installer = answer
+                .assets
+                .into_iter()
+                .find(|a| a.name.starts_with(INSTALLER_PREFIX) && a.name.ends_with(".exe"))
+                .map(|a| a.browser_download_url)
+                .filter(|url| url.starts_with(DOWNLOAD_URL));
+            Outcome::Newer(Release { tag: answer.tag_name, page, installer })
         }
         Some(_) => Outcome::UpToDate,
-        None => Outcome::Failed(format!("unrecognized release tag {:?}", release.tag_name)),
+        None => Outcome::Failed(format!("unrecognized release tag {:?}", answer.tag_name)),
     }
 }
 
-/// Checks on a background thread, then posts `msg` to `notify` with `wparam` = `manual`
-/// and `lparam` = a boxed [`Outcome`], to be claimed with [`take`]. False if no thread
-/// could be started, in which case nothing will be posted.
-pub fn check_async(notify: HWND, msg: u32, manual: bool) -> bool {
+/// Runs `work` on a short-lived thread, then posts `msg` to `notify` with `wparam` and
+/// `lparam` = the boxed result, to be claimed with [`take`]. False if no thread could be
+/// started, in which case nothing will be posted.
+fn run_async<T: Send + 'static>(notify: HWND, msg: u32, wparam: usize, work: impl FnOnce() -> T + Send + 'static) -> bool {
     let target = notify.0 as isize; // HWND is not Send; the handle itself is fine to share
     std::thread::Builder::new()
-        .name("update-check".into())
+        .name("update".into())
         .spawn(move || {
-            let result = match fetch_latest() {
-                Ok(Some(body)) => outcome(&body, current()),
-                Ok(None) => Outcome::UpToDate, // no release published yet
-                Err(e) => Outcome::Failed(e),
-            };
-            let ptr = Box::into_raw(Box::new(result));
-            let posted = unsafe {
-                PostMessageW(Some(HWND(target as *mut c_void)), msg, WPARAM(manual as usize), LPARAM(ptr as isize))
-            };
+            let ptr = Box::into_raw(Box::new(work()));
+            let posted =
+                unsafe { PostMessageW(Some(HWND(target as *mut c_void)), msg, WPARAM(wparam), LPARAM(ptr as isize)) };
             if posted.is_err() {
                 drop(unsafe { Box::from_raw(ptr) });
             }
@@ -116,12 +139,36 @@ pub fn check_async(notify: HWND, msg: u32, manual: bool) -> bool {
         .is_ok()
 }
 
-/// Claims the outcome posted by [`check_async`].
+/// Checks for a newer release. Posts an [`Outcome`], with `wparam` = `manual`.
+pub fn check_async(notify: HWND, msg: u32, manual: bool) -> bool {
+    run_async(notify, msg, manual as usize, || match get(API_HOST, LATEST_PATH, true, MAX_ANSWER) {
+        Ok(Some(body)) => outcome(&body, current()),
+        Ok(None) => Outcome::UpToDate, // no release published yet
+        Err(e) => Outcome::Failed(e),
+    })
+}
+
+/// Downloads `release`'s installer to the temp folder. Posts a `Result<PathBuf, String>`.
+pub fn download_async(notify: HWND, msg: u32, release: &Release) -> bool {
+    let Some(url) = release.installer.clone() else { return false };
+    // The tag passed parse_tag, but keep the file name plain whatever it holds.
+    let safe_tag: String = release.tag.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-')).collect();
+    let path = std::env::temp_dir().join(format!("{INSTALLER_PREFIX}{safe_tag}.exe"));
+    run_async(notify, msg, 0, move || -> Result<PathBuf, String> {
+        let path_part = url.strip_prefix("https://github.com").ok_or("unexpected download link")?;
+        let body = get("github.com", path_part, false, MAX_INSTALLER)?.ok_or("the installer is missing from the release")?;
+        std::fs::write(&path, body).map_err(|e| format!("could not save the installer: {e}"))?;
+        Ok(path)
+    })
+}
+
+/// Claims a result posted by [`check_async`] (`T` = [`Outcome`]) or [`download_async`]
+/// (`T` = `Result<PathBuf, String>`).
 ///
 /// # Safety
-/// `lp` must be the lparam of a message posted by `check_async`, claimed only once.
-pub unsafe fn take(lp: LPARAM) -> Outcome {
-    *unsafe { Box::from_raw(lp.0 as *mut Outcome) }
+/// `lp` must be the lparam of a message posted by the matching function, claimed only once.
+pub unsafe fn take<T>(lp: LPARAM) -> T {
+    *unsafe { Box::from_raw(lp.0 as *mut T) }
 }
 
 struct Handle(*mut c_void);
@@ -142,21 +189,23 @@ fn handle(h: *mut c_void, step: &str) -> Result<Handle, String> {
     }
 }
 
-/// The body of GitHub's latest-release answer, or None if the repo has no release yet.
-fn fetch_latest() -> Result<Option<Vec<u8>>, String> {
+/// An HTTPS GET. None on 404. Redirects (GitHub serves downloads from another host) are
+/// followed by WinHTTP, which never follows one from HTTPS down to HTTP.
+fn get(host: &str, path: &str, github_api: bool, max: usize) -> Result<Option<Vec<u8>>, String> {
     let fail = |step: &'static str| move |e: windows::core::Error| format!("{step}: {}", e.message());
     unsafe {
         let session = handle(
             WinHttpOpen(USER_AGENT, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, PCWSTR::null(), PCWSTR::null(), 0),
             "open",
         )?;
-        let _ = WinHttpSetTimeouts(session.0, 10_000, 10_000, 10_000, 15_000);
-        let connection = handle(WinHttpConnect(session.0, API_HOST, INTERNET_DEFAULT_HTTPS_PORT, 0), "connect")?;
+        let _ = WinHttpSetTimeouts(session.0, 10_000, 10_000, 10_000, 30_000);
+        let connection =
+            handle(WinHttpConnect(session.0, &HSTRING::from(host), INTERNET_DEFAULT_HTTPS_PORT, 0), "connect")?;
         let request = handle(
             WinHttpOpenRequest(
                 connection.0,
                 w!("GET"),
-                LATEST_PATH,
+                &HSTRING::from(path),
                 PCWSTR::null(),
                 PCWSTR::null(),
                 std::ptr::null(),
@@ -164,9 +213,13 @@ fn fetch_latest() -> Result<Option<Vec<u8>>, String> {
             ),
             "request",
         )?;
-        let headers: Vec<u16> =
-            "Accept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28\r\n".encode_utf16().collect();
-        WinHttpSendRequest(request.0, Some(&headers), None, 0, 0, 0).map_err(fail("send"))?;
+        let headers: Vec<u16> = if github_api {
+            "Accept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28\r\n".encode_utf16().collect()
+        } else {
+            Vec::new()
+        };
+        let headers = (!headers.is_empty()).then_some(headers.as_slice());
+        WinHttpSendRequest(request.0, headers, None, 0, 0, 0).map_err(fail("send"))?;
         WinHttpReceiveResponse(request.0, std::ptr::null_mut()).map_err(fail("receive"))?;
 
         let (mut status, mut size) = (0u32, size_of::<u32>() as u32);
@@ -186,7 +239,7 @@ fn fetch_latest() -> Result<Option<Vec<u8>>, String> {
         }
 
         let mut body = Vec::new();
-        let mut buf = [0u8; 8192];
+        let mut buf = [0u8; 16384];
         loop {
             let mut read = 0u32;
             WinHttpReadData(request.0, buf.as_mut_ptr() as *mut c_void, buf.len() as u32, &mut read)
@@ -195,7 +248,7 @@ fn fetch_latest() -> Result<Option<Vec<u8>>, String> {
                 return Ok(Some(body));
             }
             body.extend_from_slice(&buf[..read as usize]);
-            if body.len() > MAX_RESPONSE {
+            if body.len() > max {
                 return Err("answer from GitHub is too large".into());
             }
         }
@@ -224,48 +277,74 @@ mod tests {
         assert!(parse_tag("v0.10.0") > parse_tag("v0.9.0"));
     }
 
-    fn release(tag: &str, url: &str) -> Vec<u8> {
-        format!(r#"{{"tag_name":"{tag}","html_url":"{url}","body":"notes","assets":[]}}"#).into_bytes()
+    const PAGE: &str = "https://github.com/EnzoPENISSON/Organizer/releases/tag/v0.1.0-build.13";
+    const SETUP: &str =
+        "https://github.com/EnzoPENISSON/Organizer/releases/download/v0.1.0-build.13/Organizer-Setup-v0.1.0-build.13.exe";
+
+    fn answer(tag: &str, page: &str, assets: &[(&str, &str)]) -> Vec<u8> {
+        let assets: Vec<_> = assets
+            .iter()
+            .map(|(name, url)| serde_json::json!({ "name": name, "browser_download_url": url, "size": 1 }))
+            .collect();
+        serde_json::json!({ "tag_name": tag, "html_url": page, "body": "notes", "assets": assets })
+            .to_string()
+            .into_bytes()
+    }
+
+    fn newer(json: &[u8]) -> Release {
+        match outcome(json, [0, 1, 0, 12]) {
+            Outcome::Newer(r) => r,
+            _ => panic!("expected a newer release"),
+        }
     }
 
     #[test]
-    fn reports_newer_release() {
-        let url = "https://github.com/EnzoPENISSON/Organizer/releases/tag/v0.1.0-build.13";
-        match outcome(&release("v0.1.0-build.13", url), [0, 1, 0, 12]) {
-            Outcome::Newer { tag, url: u } => assert_eq!((tag.as_str(), u.as_str()), ("v0.1.0-build.13", url)),
-            _ => panic!("expected a newer release"),
-        }
+    fn reports_newer_release_and_its_installer() {
+        let r = newer(&answer(
+            "v0.1.0-build.13",
+            PAGE,
+            &[("organizer.exe", "https://github.com/EnzoPENISSON/Organizer/releases/download/x/organizer.exe"), ("Organizer-Setup-v0.1.0-build.13.exe", SETUP)],
+        ));
+        assert_eq!((r.tag.as_str(), r.page.as_str()), ("v0.1.0-build.13", PAGE));
+        assert_eq!(r.installer.as_deref(), Some(SETUP));
+    }
+
+    #[test]
+    fn release_without_installer_still_counts() {
+        assert_eq!(newer(&answer("v0.1.0-build.13", PAGE, &[])).installer, None);
     }
 
     #[test]
     fn same_or_older_is_up_to_date() {
-        let url = "https://github.com/EnzoPENISSON/Organizer/releases/tag/x";
-        assert!(matches!(outcome(&release("v0.1.0-build.12", url), [0, 1, 0, 12]), Outcome::UpToDate));
-        assert!(matches!(outcome(&release("v0.1.0-build.3", url), [0, 1, 0, 12]), Outcome::UpToDate));
+        assert!(matches!(outcome(&answer("v0.1.0-build.12", PAGE, &[]), [0, 1, 0, 12]), Outcome::UpToDate));
+        assert!(matches!(outcome(&answer("v0.1.0-build.3", PAGE, &[]), [0, 1, 0, 12]), Outcome::UpToDate));
     }
 
     #[test]
-    fn never_links_outside_the_repo() {
-        match outcome(&release("v9.0.0", "https://example.com/evil.exe"), [0, 1, 0, 0]) {
-            Outcome::Newer { url, .. } => assert_eq!(url, RELEASES_URL),
-            _ => panic!("expected a newer release"),
-        }
+    fn never_follows_links_outside_the_repo() {
+        let r = newer(&answer(
+            "v9.0.0",
+            "https://example.com/page",
+            &[("Organizer-Setup-v9.0.0.exe", "https://example.com/evil.exe")],
+        ));
+        assert_eq!(r.page, RELEASES_URL);
+        assert_eq!(r.installer, None);
+    }
+
+    #[test]
+    fn bad_answers_fail() {
+        assert!(matches!(outcome(b"not json", [0, 1, 0, 0]), Outcome::Failed(_)));
+        assert!(matches!(outcome(&answer("latest", PAGE, &[]), [0, 1, 0, 0]), Outcome::Failed(_)));
     }
 
     /// Talks to GitHub, so it only runs on request: `cargo test -- --ignored`.
     #[test]
     #[ignore]
     fn live_check_reaches_github() {
-        match fetch_latest() {
+        match get(API_HOST, LATEST_PATH, true, MAX_ANSWER) {
             Ok(Some(body)) => assert!(!matches!(outcome(&body, current()), Outcome::Failed(_))),
             Ok(None) => {} // no release published yet
             Err(e) => panic!("{e}"),
         }
-    }
-
-    #[test]
-    fn bad_answers_fail() {
-        assert!(matches!(outcome(b"not json", [0, 1, 0, 0]), Outcome::Failed(_)));
-        assert!(matches!(outcome(&release("latest", RELEASES_URL), [0, 1, 0, 0]), Outcome::Failed(_)));
     }
 }
