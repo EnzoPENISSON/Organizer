@@ -63,5 +63,5 @@ jobs:
       run: |
         gh release create "$TAG" "target/installer/Organizer-Setup-$TAG.exe" \
           --target "$GITHUB_SHA" \
-          --title "Organizer $VERSION (build $GITHUB_RUN_NUMBER)" \
+          --title "Organizer $VERSION" \
           --generate-notes
