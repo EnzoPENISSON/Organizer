@@ -215,44 +215,16 @@ pub fn run(start_with_new_box: bool) {
 
 // ---- Tray ----
 
-/// A small 2x2 grid of boxes, drawn in code so the exe needs no resource file.
+/// The app icon embedded by build.rs (from assets/organizer.ico), at the tray's size.
 unsafe fn make_tray_icon() -> HICON {
-    const SIZE: i32 = 32;
+    /// Resource id given to the icon in build.rs.
+    const ICON_ID: u16 = 1;
     unsafe {
-        let info = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: SIZE,
-                biHeight: -SIZE,
-                biPlanes: 1,
-                biBitCount: 32,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let mut bits = std::ptr::null_mut();
-        let color = CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut bits, None, 0).expect("icon bitmap");
-        let pixels = std::slice::from_raw_parts_mut(bits as *mut u32, (SIZE * SIZE) as usize);
-        for y in 0..SIZE {
-            for x in 0..SIZE {
-                let in_box = |v: i32| (2..15).contains(&v) || (17..30).contains(&v);
-                if in_box(x) && in_box(y) {
-                    let bgra = match (x < 16, y < 16) {
-                        (true, true) => 0xFF4F9BE8u32,
-                        (false, true) => 0xFF4CC38Au32,
-                        (true, false) => 0xFFE8B04Fu32,
-                        (false, false) => 0xFFB98CF0u32,
-                    };
-                    pixels[(y * SIZE + x) as usize] = bgra;
-                }
-            }
-        }
-        let mask = CreateBitmap(SIZE, SIZE, 1, 1, None);
-        let icon = CreateIconIndirect(&ICONINFO { fIcon: true.into(), hbmMask: mask, hbmColor: color, ..Default::default() })
-            .unwrap_or_else(|_| LoadIconW(None, IDI_APPLICATION).unwrap_or_default());
-        let _ = DeleteObject(color.into());
-        let _ = DeleteObject(mask.into());
-        icon
+        let instance: HINSTANCE = GetModuleHandleW(None).expect("module handle").into();
+        let (cx, cy) = (GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
+        LoadImageW(Some(instance), PCWSTR(ICON_ID as usize as *const u16), IMAGE_ICON, cx, cy, LR_DEFAULTCOLOR)
+            .map(|h| HICON(h.0))
+            .unwrap_or_else(|_| LoadIconW(None, IDI_APPLICATION).unwrap_or_default())
     }
 }
 

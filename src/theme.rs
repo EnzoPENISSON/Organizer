@@ -66,7 +66,7 @@ pub const DEFAULT_CSS: &str = r#"/* Organizer theme — "Frosted Glass". Save th
   font-family: "Segoe UI Variable Display";  /* DIN-style, ships with Windows */
   font-size: 13px;
   font-weight: 600;
-  text-align: center;
+  text-align: left;
   text-transform: uppercase;
   letter-spacing: 1.6px;
 }

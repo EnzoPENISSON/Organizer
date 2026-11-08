@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="256" height="256">
+  <!-- Pixel-aligned logo for 16-20 px (the tray at 100-125% scaling). -->
+  <rect width="16" height="16" rx="3.5" fill="#1F232D"/>
+  <rect x="1" y="1" width="14" height="14" rx="3" fill="#8FB4F5"/>
+  <rect x="2" y="2" width="12" height="12" rx="2" fill="#1C2230"/>
+  <rect x="3" y="3" width="4" height="4" rx="1" fill="#4F9BE8"/>
+  <rect x="9" y="3" width="4" height="4" rx="1" fill="#4CC38A"/>
+  <rect x="3" y="9" width="4" height="4" rx="1" fill="#E8B04F"/>
+  <rect x="9" y="9" width="4" height="4" rx="1" fill="#B98CF0"/>
+</svg>

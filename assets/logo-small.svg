@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="256" height="256">
+  <!-- Simplified logo for 16-32 px (tray, small Explorer views). Edges sit on whole units
+       so it stays crisp when scaled down. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2E3440"/>
+      <stop offset="1" stop-color="#151821"/>
+    </linearGradient>
+  </defs>
+  <rect width="32" height="32" rx="7" fill="url(#bg)"/>
+  <!-- Box: rim, with a thicker top edge for the title bar -->
+  <rect x="3" y="3" width="26" height="26" rx="5" fill="#8FB4F5"/>
+  <rect x="5" y="7" width="22" height="20" rx="2" fill="#1C2230"/>
+  <!-- Icons -->
+  <rect x="7"  y="9"  width="8" height="7" rx="2" fill="#4F9BE8"/>
+  <rect x="17" y="9"  width="8" height="7" rx="2" fill="#4CC38A"/>
+  <rect x="7"  y="18" width="8" height="7" rx="2" fill="#E8B04F"/>
+  <rect x="17" y="18" width="8" height="7" rx="2" fill="#B98CF0"/>
+</svg>
