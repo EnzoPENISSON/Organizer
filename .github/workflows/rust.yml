@@ -11,12 +11,39 @@ env:
 
 jobs:
   build:
-
-    runs-on: ubuntu-latest
+    # Organizer is a Windows-only app: the `windows` crate does not build on Linux,
+    # and the icon/manifest embedding needs the MSVC linker.
+    runs-on: windows-latest
+    permissions:
+      contents: write  # to create the release
 
     steps:
     - uses: actions/checkout@v4
+
+    - uses: Swatinem/rust-cache@v2
+
     - name: Build
-      run: cargo build --verbose
+      run: cargo build --release --verbose
+
     - name: Run tests
       run: cargo test --verbose
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: organizer
+        path: target/release/organizer.exe
+
+    # Every push to master publishes a release, tagged with the Cargo.toml version and the
+    # run number (e.g. v0.1.0-build.12) so each tag is unique. Pull requests only build.
+    - name: Create release
+      if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+        tag="v${version}-build.${GITHUB_RUN_NUMBER}"
+        gh release create "$tag" target/release/organizer.exe \
+          --target "$GITHUB_SHA" \
+          --title "Organizer $version (build $GITHUB_RUN_NUMBER)" \
+          --generate-notes
