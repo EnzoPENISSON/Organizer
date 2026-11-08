@@ -38,6 +38,7 @@ Organizer runs from the system tray (it may be under the `^` overflow arrow).
 | Rename a box | Double-click the title bar |
 | Delete a box | Right-click the title bar |
 | Change the color or design | Tray icon > **Customize design (theme.css)** |
+| Hide or show boxes and icons | Double-click empty desktop space, or tray icon > **Hide boxes and icons** |
 | Prevent accidental moves | Tray icon > **Lock boxes** |
 | Start at login | Tray icon > **Start with Windows** |
 | Check for updates | Automatic twice a day, or tray icon > **Check for updates**. When a newer release is out, click the notification or **Install update**: the installer runs and Organizer restarts |

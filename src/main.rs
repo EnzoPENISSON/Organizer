@@ -7,6 +7,7 @@ mod store;
 mod theme;
 mod ui;
 mod update;
+mod watch;
 
 use windows::Win32::System::{
     Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize},

@@ -12,10 +12,12 @@ use windows::{
         },
         UI::{
             HiDpi::GetDpiForWindow,
-            WindowsAndMessaging::{FindWindowExW, SMTO_ABORTIFHUNG, SendMessageTimeoutW},
+            WindowsAndMessaging::{
+                FindWindowExW, SMTO_ABORTIFHUNG, SW_HIDE, SW_SHOWNA, SendMessageTimeoutW, ShowWindowAsync,
+            },
             Shell::{
                 Common::{ITEMIDLIST, STRRET},
-                FWF_AUTOARRANGE, FWF_SNAPTOGRID, IFolderView2, IShellBrowser, IShellFolder,
+                FWF_AUTOARRANGE, FWF_NOICONS, FWF_SNAPTOGRID, IFolderView2, IShellBrowser, IShellFolder,
                 IShellView, IShellWindows, SHGDN_FORPARSING, SVGIO_ALLVIEW, SVSI_POSITIONITEM,
                 SWC_DESKTOP, SWFO_NEEDDISPATCH, ShellWindows, StrRetToStrW,
             },
@@ -78,6 +80,23 @@ impl Desktop {
 
     pub fn hwnd(&self) -> HWND {
         self.hwnd
+    }
+
+    /// Explorer's list control, which draws the icons.
+    pub fn list(&self) -> HWND {
+        self.list
+    }
+
+    /// Shows or hides every desktop icon, the same setting as the desktop's View > Show
+    /// desktop icons. The list control is also switched directly, in case a Windows version
+    /// does not redraw on the flag alone; the two always agree.
+    pub fn set_icons_visible(&self, visible: bool) -> Result<()> {
+        let flag = FWF_NOICONS.0 as u32;
+        let result = unsafe { self.view.SetCurrentFolderFlags(flag, if visible { 0 } else { flag }) };
+        if !self.list.is_invalid() {
+            let _ = unsafe { ShowWindowAsync(self.list, if visible { SW_SHOWNA } else { SW_HIDE }) };
+        }
+        result
     }
 
     /// `title`, `border` and `pad` are CSS pixels from the theme.

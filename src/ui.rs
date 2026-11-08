@@ -16,7 +16,7 @@ use crate::{
     render::{self, Layer, Sizes},
     store::{self, Snapshot, State},
     theme::{Align, Theme},
-    update,
+    update, watch,
 };
 use std::{cell::RefCell, collections::HashMap, rc::Rc, time::SystemTime};
 use windows::{
@@ -62,6 +62,12 @@ const WM_UPDATE: u32 = WM_APP + 4;
 const WM_EXIT: u32 = WM_APP + 5;
 /// Posted when the update installer has been downloaded. See `update::download_async`.
 const WM_UPDATE_DOWNLOADED: u32 = WM_APP + 6;
+/// Posted by `watch` for a double-click while the desktop is in front.
+const WM_DESKTOP_DOUBLE_CLICK: u32 = WM_APP + 7;
+const FADE_TIMER: usize = 3;
+const FADE_MS: f32 = 200.0;
+/// About 60 frames a second, only while a fade runs.
+const FADE_FRAME_MS: u32 = 16;
 const UPDATE_TIMER: usize = 2;
 /// The first check waits a minute so it never competes with startup work.
 const UPDATE_FIRST_MS: u32 = 60 * 1000;
@@ -86,6 +92,7 @@ const CMD_EXIT: usize = 5;
 const CMD_THEME: usize = 6;
 const CMD_CHECK_UPDATE: usize = 7;
 const CMD_INSTALL_UPDATE: usize = 8;
+const CMD_HIDE: usize = 9;
 const CMD_RENAME: usize = 10;
 const CMD_DELETE: usize = 11;
 
@@ -126,6 +133,24 @@ struct App {
     update: Option<update::Release>,
     checking_update: bool,
     downloading_update: bool,
+    fade: Fade,
+}
+
+/// Hiding the desktop: boxes fade, icons switch off. Not saved, so Organizer always starts
+/// with everything shown.
+struct Fade {
+    hidden: bool,
+    /// Current opacity of every box window.
+    alpha: u8,
+    /// Opacity when the running fade started, and when it started.
+    from: u8,
+    start: Option<std::time::Instant>,
+}
+
+impl Default for Fade {
+    fn default() -> Self {
+        Self { hidden: false, alpha: 255, from: 255, start: None }
+    }
 }
 
 thread_local! {
@@ -233,6 +258,7 @@ pub fn run(start_with_new_box: bool) {
         if update::is_release_build() {
             SetTimer(Some(host), UPDATE_TIMER, UPDATE_FIRST_MS, None);
         }
+        watch::start(host, WM_DESKTOP_DOUBLE_CLICK);
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -240,6 +266,10 @@ pub fn run(start_with_new_box: bool) {
             DispatchMessageW(&msg);
         }
 
+        // Never leave the desktop without icons.
+        if let Some(d) = with_app(|a| a.desktop.clone().filter(|_| a.fade.hidden)) {
+            let _ = d.set_icons_visible(true);
+        }
         remove_tray_icon();
         unregister_desktop_menu();
         destroy_box_windows();
@@ -472,6 +502,8 @@ fn show_tray_menu() {
         let check = |on: bool| if on { MF_CHECKED } else { MF_UNCHECKED };
         let _ = AppendMenuW(menu, MF_STRING, CMD_NEW, w!("New box"));
         let _ = AppendMenuW(menu, MF_STRING | check(locked), CMD_LOCK, w!("Lock boxes"));
+        let hidden = with_app(|a| a.fade.hidden);
+        let _ = AppendMenuW(menu, MF_STRING | check(hidden), CMD_HIDE, w!("Hide boxes and icons\tDouble-click desktop"));
         let _ = AppendMenuW(menu, MF_STRING, CMD_THEME, w!("Customize design (theme.css)"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let _ = AppendMenuW(menu, MF_STRING | check(autostart_enabled()), CMD_AUTOSTART, w!("Start with Windows"));
@@ -502,6 +534,7 @@ fn show_tray_menu() {
                 save();
             }
             CMD_THEME => open_theme(),
+            CMD_HIDE => set_hidden(!hidden),
             CMD_AUTOSTART => set_autostart(!autostart_enabled()),
             CMD_RESTORE => restore_original(),
             CMD_CHECK_UPDATE => start_update_check(true),
@@ -559,6 +592,10 @@ fn connect() -> bool {
         }
     };
     let metrics = read_metrics(&desktop).ok();
+    // Explorer restarted while the desktop was hidden: start over with everything shown.
+    if with_app(|a| std::mem::take(&mut a.fade).hidden) {
+        let _ = desktop.set_icons_visible(true);
+    }
     destroy_box_windows();
     with_app(|a| {
         a.desktop = Some(desktop);
@@ -676,11 +713,7 @@ fn game_is_running() -> bool {
 }
 
 fn desktop_is_active() -> bool {
-    unsafe {
-        let mut class = [0u16; 16];
-        let n = GetClassNameW(GetForegroundWindow(), &mut class) as usize;
-        matches!(String::from_utf16_lossy(&class[..n]).as_str(), "Progman" | "WorkerW")
-    }
+    watch::is_desktop(unsafe { GetForegroundWindow() })
 }
 
 /// Asking Explorer about every icon is the app's only recurring cost, so it only happens
@@ -738,8 +771,16 @@ fn poll_inner() {
         connect();
         return;
     }
-    if with_app(|a| a.state.boxes.is_empty()) {
+    // Hidden, nothing can be seen or dragged, so there is nothing to check.
+    if with_app(|a| a.state.boxes.is_empty() || a.fade.hidden) {
         return;
+    }
+    // Explorer sometimes raises its icon list (showing icons, refreshing): the boxes would
+    // still be there, just underneath. The topmost child is one cheap lookup.
+    if unsafe { GetWindow(d.hwnd(), GW_CHILD) }.is_ok_and(|top| top == d.list()) {
+        for (frame, tint) in all_box_windows() {
+            raise(frame, tint);
+        }
     }
     reload_theme_if_changed(&d);
     if !icons_need_checking() {
@@ -780,6 +821,7 @@ fn poll_inner() {
 // ---- Box actions ----
 
 fn new_box() {
+    set_hidden(false); // a new box should be seen
     let Some((d, m)) = with_app(|a| a.desktop.clone().zip(a.metrics)) else { return };
     let icons = d.icons().unwrap_or_default();
     let view = d.hwnd();
@@ -968,8 +1010,152 @@ fn create_box_windows(id: u64) {
             a.rendered_size.remove(&id);
         });
         sync_windows(id);
-        let _ = ShowWindow(tint, SW_SHOWNA);
-        let _ = ShowWindow(frame, SW_SHOWNA);
+        if with_app(|a| a.fade.alpha > 0) {
+            let _ = ShowWindow(tint, SW_SHOWNA);
+            let _ = ShowWindow(frame, SW_SHOWNA);
+        }
+    }
+}
+
+// ---- Hiding the desktop ----
+
+/// Toggles on a double-click on empty desktop space. Not on an icon (that opens it) and
+/// not on a box's title bar (that renames the box).
+fn on_desktop_double_click(lp: LPARAM) {
+    let pt = POINT { x: loword(lp.0), y: hiword(lp.0) };
+    let Some((d, m, hidden)) = with_app(|a| {
+        let busy = a.drag.is_some() || a.rename.is_some();
+        (!busy).then(|| Some((a.desktop.clone()?, a.metrics?, a.fade.hidden))).flatten()
+    }) else {
+        return;
+    };
+    let hit = unsafe { WindowFromPoint(pt) };
+    if !watch::is_desktop(unsafe { GetAncestor(hit, GA_ROOT) }) {
+        return;
+    }
+    if !hidden {
+        if hit != d.hwnd() && hit != d.list() {
+            return;
+        }
+        let mut p = pt;
+        unsafe {
+            let _ = ScreenToClient(d.hwnd(), &mut p);
+        }
+        // An icon's position is its image's corner; its clickable cell surrounds it.
+        let on_icon = d.icons().map_or(true, |icons| {
+            icons.iter().any(|i| {
+                let (x, y) = (i.x - m.icon_x, i.y - m.icon_y);
+                (x..x + m.cell_w).contains(&p.x) && (y..y + m.cell_h).contains(&p.y)
+            })
+        });
+        if on_icon {
+            return;
+        }
+    }
+    set_hidden(!hidden);
+}
+
+/// Fades the boxes out or in. The icons switch at the start, so showing feels immediate.
+fn set_hidden(hide: bool) {
+    let Some((d, host)) = with_app(|a| {
+        if a.fade.hidden == hide {
+            return None;
+        }
+        a.fade.hidden = hide;
+        a.fade.from = a.fade.alpha;
+        a.fade.start = Some(std::time::Instant::now());
+        Some((a.desktop.clone()?, a.host))
+    }) else {
+        return;
+    };
+    if let Err(e) = d.set_icons_visible(!hide) {
+        store::log(&format!("could not {} the desktop icons: {e}", if hide { "hide" } else { "show" }));
+    }
+    if !hide {
+        for (frame, tint) in all_box_windows() {
+            raise(frame, tint);
+            unsafe {
+                let _ = ShowWindow(tint, SW_SHOWNA);
+                let _ = ShowWindow(frame, SW_SHOWNA);
+            }
+        }
+    }
+    unsafe { SetTimer(Some(host), FADE_TIMER, FADE_FRAME_MS, None) };
+    fade_step();
+}
+
+/// Puts a box above the icon list again: frame on top, its tint right below. Only the
+/// stacking order changes.
+fn raise(frame: HWND, tint: HWND) {
+    let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
+    unsafe {
+        let _ = SetWindowPos(frame, Some(HWND_TOP), 0, 0, 0, 0, flags);
+        let _ = SetWindowPos(tint, Some(frame), 0, 0, 0, 0, flags);
+    }
+}
+
+fn all_box_windows() -> Vec<(HWND, HWND)> {
+    with_app(|a| a.windows.values().copied().collect())
+}
+
+/// One frame of the fade. Only the windows' overall opacity changes, so nothing is redrawn.
+fn fade_step() {
+    let step = with_app(|a| {
+        let f = &mut a.fade;
+        let start = f.start?;
+        let t = (start.elapsed().as_secs_f32() * 1000.0 / FADE_MS).min(1.0);
+        let eased = 1.0 - (1.0 - t).powi(3); // ease-out: quick start, soft landing
+        let to = if f.hidden { 0.0 } else { 255.0 };
+        f.alpha = (f.from as f32 + (to - f.from as f32) * eased).round() as u8;
+        let done = t >= 1.0;
+        if done {
+            f.start = None;
+        }
+        Some((f.alpha, done, f.hidden))
+    });
+    let host = with_app(|a| a.host);
+    let Some((alpha, done, hidden)) = step else {
+        unsafe {
+            let _ = KillTimer(Some(host), FADE_TIMER);
+        }
+        return;
+    };
+    for (frame, tint) in all_box_windows() {
+        if !hidden {
+            // Showing the icons brings Explorer's icon list to the top, over the boxes, and
+            // Explorer may do it a moment later. Raising every frame of the fade-in wins.
+            raise(frame, tint);
+        }
+        set_opacity(frame, alpha);
+        set_opacity(tint, alpha);
+        if done && hidden {
+            // Hidden windows cost the compositor nothing and can never catch a click.
+            unsafe {
+                let _ = ShowWindow(frame, SW_HIDE);
+                let _ = ShowWindow(tint, SW_HIDE);
+            }
+        }
+    }
+    if done {
+        unsafe {
+            let _ = KillTimer(Some(host), FADE_TIMER);
+        }
+    }
+}
+
+fn blend(alpha: u8) -> BLENDFUNCTION {
+    BLENDFUNCTION {
+        BlendOp: AC_SRC_OVER as u8,
+        SourceConstantAlpha: alpha,
+        AlphaFormat: AC_SRC_ALPHA as u8,
+        ..Default::default()
+    }
+}
+
+/// Changes a layered window's overall opacity, keeping its pixels.
+fn set_opacity(hwnd: HWND, alpha: u8) {
+    unsafe {
+        let _ = UpdateLayeredWindow(hwnd, None, None, None, None, None, COLORREF(0), Some(&blend(alpha)), ULW_ALPHA);
     }
 }
 
@@ -1082,16 +1268,12 @@ fn with_bitmap<R>(w: i32, h: i32, f: impl FnOnce(HDC, &mut [u32]) -> R) -> Optio
 }
 
 fn show_layer(hwnd: HWND, layer: &Layer) {
+    // Keeps the current fade, so a redraw mid-fade or while hidden does not pop in.
+    let blend = blend(with_app(|a| a.fade.alpha));
     with_bitmap(layer.w, layer.h, |dc, px| unsafe {
         px.copy_from_slice(&layer.px);
         let size = SIZE { cx: layer.w, cy: layer.h };
         let origin = POINT::default();
-        let blend = BLENDFUNCTION {
-            BlendOp: AC_SRC_OVER as u8,
-            SourceConstantAlpha: 255,
-            AlphaFormat: AC_SRC_ALPHA as u8,
-            ..Default::default()
-        };
         if let Err(e) = UpdateLayeredWindow(hwnd, None, None, Some(&size), Some(dc), Some(&origin), COLORREF(0), Some(&blend), ULW_ALPHA) {
             store::log(&format!("could not draw a box: {e}"));
         }
@@ -1291,6 +1473,8 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             unsafe { SetTimer(Some(hwnd), UPDATE_TIMER, UPDATE_EVERY_MS, None) };
             start_update_check(false);
         }
+        WM_TIMER if wp.0 == FADE_TIMER => fade_step(),
+        WM_DESKTOP_DOUBLE_CLICK => on_desktop_double_click(lp),
         WM_UPDATE => on_update_checked(wp.0 != 0, unsafe { update::take(lp) }),
         WM_UPDATE_DOWNLOADED => on_update_downloaded(unsafe { update::take(lp) }),
         WM_EXIT => unsafe { PostQuitMessage(0) },
