@@ -2,10 +2,11 @@
   <img src="assets/logo.svg" width="96" alt="Organizer logo">
 </p>
 
-<h1 align="center">Organizer</h1>
+<h1 align="center">Organizer: a free desktop icon organizer for Windows</h1>
 
 <p align="center">
-  Group your Windows desktop icons into glowing, translucent boxes that you can style with CSS.
+  Group your Windows 10 and Windows 11 desktop icons into glowing, translucent boxes that you can style with CSS.
+  Free, open source and lightweight.
 </p>
 
 <p align="center">
@@ -13,13 +14,25 @@
   <a href="https://buymeacoffee.com/enzop2503o"><img src="https://img.shields.io/badge/Buy%20me%20a%20coffee-FFDD00?logo=buymeacoffee&logoColor=black" alt="Buy me a coffee"></a>
 </p>
 
-![Desktop icons grouped into Apps, Work, Media, Games and Downloads boxes](docs/images/desktop.png)
+![A Windows 11 desktop organized with Organizer: icons grouped into PC, Launcher, Games and Development boxes](docs/images/desktop.png)
 
-Built to stay out of the way: about 2 MB of RAM, almost no CPU, and it stops checking
-entirely while a fullscreen game runs.
+Organizer cleans up a cluttered Windows desktop by grouping shortcuts, files and folders into
+boxes you can move, resize and rename. Built to stay out of the way: about 2 MB of RAM, almost
+no CPU, and it stops checking entirely while a fullscreen game runs.
 
 Your files never move. Boxes only control where the real desktop icons sit, so opening,
 renaming, right-clicking and dragging icons all work as usual.
+
+## Features
+
+- **Desktop boxes:** group desktop icons into boxes, and drag icons in and out
+- **Hide the desktop:** double-click empty space to fade out every box and icon
+- **CSS themes:** change colors, borders, glow and fonts with a `theme.css` file
+- **Lightweight:** native Rust, about 2 MB of RAM, no browser engine
+- **Game friendly:** pauses itself while a fullscreen game runs
+- **Safe:** never moves or changes your files, and restores your original layout in one click
+- **Automatic updates:** checks GitHub releases and installs new versions
+- **No admin rights:** installs for your account only
 
 ## Install
 
@@ -61,10 +74,10 @@ Organizer runs from the system tray (it may be under the `^` overflow arrow).
 Deleting a box leaves its icons where they are. Moving a box over loose icons adds them to it.
 A box grows when it is too small for its icons.
 
-Double-clicking the desktop fades the boxes and icons out, leaving only the wallpaper
+Double-clicking the desktop fades the boxes and icons out, leaving only the wallpaper.
 
 <p align="center">
-  <img src="docs/images/tray-menu.png" width="480" alt="The tray menu">
+  <img src="docs/images/tray-menu.png" width="480" alt="Organizer tray menu: new box, lock boxes, hide boxes and icons, customize design, check for updates">
 </p>
 
 ## Customize with CSS
@@ -160,8 +173,31 @@ create `theme.css` if it is missing. Run it with output redirected, for example
 
 Run the unit tests with `cargo test`.
 
-The README images are drawn by `python assets/make-images.py`, and the app icon by
-`assets/make-icon.ps1`.
+The app icon is drawn by `assets/make-icon.ps1`.
+
+## FAQ
+
+**How do I organize desktop icons on Windows 11 or Windows 10?**
+Install Organizer, create a box from the tray icon, and drag icons into it. Each box keeps its
+icons together when you move it.
+
+**Is Organizer free?**
+Yes. It is free and open source under the MIT license, with no ads, accounts or telemetry. Its only network use is checking GitHub for updates.
+
+**Is it an alternative to Stardock Fences?**
+It covers the same basic idea of grouping desktop icons into containers, as a small, free and
+open-source app. It does not try to copy every Fences feature.
+
+**Does it move or change my files?**
+No. It only changes where icons appear on the desktop. **Remove all boxes and restore original
+layout** puts every icon back where it was.
+
+**Does it slow down games?**
+No. It uses almost no CPU and stops checking entirely while a fullscreen app runs.
+
+**How do I uninstall it?**
+Settings > Apps > Installed apps > Organizer > Uninstall. Run the restore command first if you
+want your original icon layout back.
 
 ## Support
 

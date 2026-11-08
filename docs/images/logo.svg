@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <title>Organizer</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2E3440"/>
+      <stop offset="1" stop-color="#151821"/>
+    </linearGradient>
+    <linearGradient id="glass" x1="0" y1="0" x2="0.6" y2="1">
+      <stop offset="0" stop-color="#8FB8F5" stop-opacity="0.28"/>
+      <stop offset="1" stop-color="#0A0C14" stop-opacity="0.10"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#A9CBFF"/>
+      <stop offset="1" stop-color="#6A8FD8"/>
+    </linearGradient>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="7"/>
+    </filter>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="3" stdDeviation="3" flood-color="#000" flood-opacity="0.45"/>
+    </filter>
+    <clipPath id="boxClip">
+      <rect x="40" y="58" width="176" height="152" rx="20"/>
+    </clipPath>
+  </defs>
+
+  <!-- App tile -->
+  <rect width="256" height="256" rx="56" fill="url(#bg)"/>
+
+  <!-- Glow behind the box -->
+  <rect x="40" y="58" width="176" height="152" rx="20" fill="none"
+        stroke="#7FA9F0" stroke-width="6" opacity="0.75" filter="url(#glow)"/>
+
+  <!-- Translucent box -->
+  <rect x="40" y="58" width="176" height="152" rx="20" fill="url(#glass)"/>
+  <!-- Title bar -->
+  <rect x="40" y="58" width="176" height="34" fill="#A9CBFF" opacity="0.16" clip-path="url(#boxClip)"/>
+  <rect x="58" y="71" width="58" height="8" rx="4" fill="#DCE8FF" opacity="0.85"/>
+  <!-- Rim -->
+  <rect x="40" y="58" width="176" height="152" rx="20" fill="none" stroke="url(#rim)" stroke-width="5"/>
+
+  <!-- Icons in the box -->
+  <g filter="url(#shadow)">
+    <rect x="62"  y="110" width="40" height="40" rx="10" fill="#4F9BE8"/>
+    <rect x="114" y="110" width="40" height="40" rx="10" fill="#4CC38A"/>
+    <rect x="62"  y="158" width="40" height="40" rx="10" fill="#E8B04F"/>
+  </g>
+
+  <!-- Empty slot, and an icon being dragged into it -->
+  <rect x="166" y="110" width="40" height="40" rx="10" fill="none"
+        stroke="#DCE8FF" stroke-opacity="0.35" stroke-width="2.5" stroke-dasharray="6 5"/>
+  <g filter="url(#shadow)" transform="rotate(-12 196 82)">
+    <rect x="176" y="62" width="40" height="40" rx="10" fill="#B98CF0"/>
+  </g>
+</svg>
