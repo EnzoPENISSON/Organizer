@@ -64,6 +64,7 @@ Organizer runs from the system tray (it may be under the `^` overflow arrow).
 | Add an icon | Drag it into a box |
 | Remove an icon | Drag it out of the box |
 | Reorder icons | Drag an icon within its box |
+| Choose how a box arranges its icons | Right-click its title bar > **Arrange icons** > **Automatically, each new icon after the last** (no gaps), or **Where I drop them** (each icon stays in its cell, empty cells allowed, dropping on a taken cell swaps the two) |
 | Move a box (its icons follow) | Drag the title bar |
 | Resize a box | Drag the left, right or bottom edge |
 | Rename a box | Double-click the title bar |

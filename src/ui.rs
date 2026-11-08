@@ -12,7 +12,7 @@
 
 use crate::{
     desktop::Desktop,
-    model::{self, DesktopBox, Edges, Metrics, Rect},
+    model::{self, Arrange, DesktopBox, Edges, Metrics, Rect},
     render::{self, Layer, Sizes},
     settings,
     store::{self, Snapshot, State},
@@ -65,6 +65,18 @@ const WM_EXIT: u32 = WM_APP + 5;
 const WM_UPDATE_DOWNLOADED: u32 = WM_APP + 6;
 /// Posted by `watch` for a double-click while the desktop is in front.
 const WM_DESKTOP_DOUBLE_CLICK: u32 = WM_APP + 7;
+/// Posted by `watch` when the left button is released while the desktop is in front.
+const WM_DESKTOP_RELEASE: u32 = WM_APP + 8;
+/// Posted by `watch` when a drag starts on the desktop.
+const WM_DESKTOP_DRAG: u32 = WM_APP + 9;
+/// After a drag starts or ends, rolled-up boxes' icons are checked quickly while the icons
+/// are frozen (see `watch::freeze`), then less often for a while, since Explorer may move
+/// them again a moment later.
+const REPARK_TIMER: usize = 5;
+const REPARK_FAST_MS: u32 = 15;
+const REPARK_FAST_FOR_MS: u128 = 150;
+const REPARK_EVERY_MS: u32 = 50;
+const REPARK_FOR_MS: u128 = 3000;
 const FADE_TIMER: usize = 3;
 const FADE_MS: f32 = 200.0;
 /// About 60 frames a second, only while a fade runs.
@@ -104,6 +116,8 @@ const CMD_RENAME: usize = 10;
 const CMD_DELETE: usize = 11;
 const CMD_ROLL: usize = 12;
 const CMD_SETTINGS: usize = 13;
+const CMD_ARRANGE_AUTO: usize = 14;
+const CMD_ARRANGE_FREE: usize = 15;
 
 struct Drag {
     id: u64,
@@ -117,6 +131,16 @@ struct Drag {
 struct Reload {
     before: Vec<model::Icon>,
     checks: u32,
+}
+
+struct Repark {
+    start: std::time::Instant,
+    /// Still checking at the quick pace.
+    fast: bool,
+    /// Icons Explorer pulled back have been parked again since this started.
+    fixed: bool,
+    /// For the log: "drag start" or "drop".
+    moment: &'static str,
 }
 
 /// A box rolling open or shut. Its window height slides from `from` to `to`.
@@ -168,6 +192,8 @@ struct App {
     last_icons: Vec<model::Icon>,
     /// Icons seen by the last check, trusted or not.
     last_icon_count: usize,
+    /// Watching rolled-up boxes' icons after a drag started or ended. See `repark`.
+    repark: Option<Repark>,
 }
 
 /// What is on screen of a box: its shown part, at the height a roll has reached so far.
@@ -298,7 +324,7 @@ pub fn run(start_with_new_box: bool) {
         if update::is_release_build() {
             SetTimer(Some(host), UPDATE_TIMER, UPDATE_FIRST_MS, None);
         }
-        watch::start(host, WM_DESKTOP_DOUBLE_CLICK);
+        watch::start(host, WM_DESKTOP_DOUBLE_CLICK, WM_DESKTOP_RELEASE, WM_DESKTOP_DRAG);
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -313,7 +339,9 @@ pub fn run(start_with_new_box: bool) {
         if let Some(d) = with_app(|a| a.desktop.clone().filter(|_| a.fade.hidden)) {
             let _ = d.set_icons_visible(true);
         }
-        // Nor with icons parked out of reach. The boxes stay rolled up in boxes.json.
+        // Nor with its icons frozen or parked out of reach. The boxes stay rolled up in boxes.json.
+        watch::set_freeze_target(None);
+        watch::unfreeze();
         finish_rolls();
         unpark(&with_app(|a| a.state.boxes.clone()));
         remove_tray_icon();
@@ -650,12 +678,21 @@ fn show_box_menu(id: u64) {
         let _ = AppendMenuW(menu, MF_STRING, CMD_NEW, w!("New box"));
         let _ = AppendMenuW(menu, MF_STRING, CMD_RENAME, w!("Rename"));
         let _ = AppendMenuW(menu, MF_STRING, CMD_ROLL, if b.collapsed { w!("Expand") } else { w!("Roll up") });
+        // Destroyed along with the menu that holds it.
+        if let Ok(arrange) = CreatePopupMenu() {
+            let pick = |a: Arrange| if b.arrange == a { MF_CHECKED } else { MF_UNCHECKED };
+            let _ = AppendMenuW(arrange, MF_STRING | pick(Arrange::Auto), CMD_ARRANGE_AUTO, w!("Automatically, each new icon after the last"));
+            let _ = AppendMenuW(arrange, MF_STRING | pick(Arrange::Free), CMD_ARRANGE_FREE, w!("Where I drop them"));
+            let _ = AppendMenuW(menu, MF_POPUP, arrange.0 as usize, w!("Arrange icons"));
+        }
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let _ = AppendMenuW(menu, MF_STRING, CMD_DELETE, w!("Delete box (icons stay on the desktop)"));
         match track_menu(menu) {
             CMD_NEW => new_box(),
             CMD_RENAME => begin_rename(id),
             CMD_ROLL => set_collapsed(id, !b.collapsed),
+            CMD_ARRANGE_AUTO => set_arrange(id, Arrange::Auto),
+            CMD_ARRANGE_FREE => set_arrange(id, Arrange::Free),
             CMD_DELETE => delete_box(id),
             _ => {}
         }
@@ -747,6 +784,7 @@ fn prepare_desktop(d: &Desktop) -> windows::core::Result<()> {
 
 /// Moves every box's icons to their slots and syncs windows to the settled rectangles.
 fn place_all() {
+    sync_freeze_target();
     let Some((d, m)) = with_app(|a| a.desktop.clone().zip(a.metrics)) else { return };
     if let Err(e) = prepare_desktop(&d) {
         store::log(&format!("could not prepare the desktop: {e}"));
@@ -767,6 +805,7 @@ fn place_all() {
 }
 
 fn poll() {
+    sync_freeze_target();
     // Stay out of the way mid-gesture: a half-finished drag is not a final position.
     // Mid-roll, an open box has some icons still parked, which would read as dragged out.
     let busy = with_app(|a| a.polling || a.drag.is_some() || a.rename.is_some() || !a.rolling.is_empty());
@@ -966,6 +1005,7 @@ fn new_box() {
             rect,
             members: Vec::new(),
             collapsed: false,
+            arrange: Arrange::Auto,
         });
         id
     });
@@ -1058,6 +1098,104 @@ fn roll_step() {
     }
 }
 
+/// Explorer pulls the icons of rolled-up boxes, which it sees as off the desktop, back onto
+/// it when a drag starts or ends there. They can't be kept from that, so `watch` freezes
+/// the icons' drawing at those moments, and this parks them again before drawing resumes:
+/// the desktop is only ever drawn with them out of sight.
+fn start_reparking(moment: &'static str) {
+    let host = with_app(|a| {
+        let any = a.state.boxes.iter().any(|b| b.collapsed);
+        if any {
+            a.repark = Some(Repark { start: std::time::Instant::now(), fast: true, fixed: false, moment });
+        }
+        any.then_some(a.host)
+    });
+    let Some(host) = host else {
+        watch::unfreeze();
+        return;
+    };
+    unsafe { SetTimer(Some(host), REPARK_TIMER, REPARK_FAST_MS, None) };
+    repark();
+}
+
+/// One check: parks any icon of a rolled-up box that is on screen, with the fast move, and
+/// lifts the freeze once that is done, or once it is clear there is nothing to do.
+fn repark() {
+    let info = with_app(|a| {
+        let r = a.repark.as_mut()?;
+        let elapsed = r.start.elapsed().as_millis();
+        let slow_down = r.fast && elapsed > REPARK_FAST_FOR_MS;
+        r.fast &= !slow_down;
+        let state = (elapsed, r.fixed, r.moment, slow_down, elapsed > REPARK_FOR_MS);
+        if state.4 {
+            a.repark = None;
+        }
+        // A roll in progress places those icons itself; a hidden desktop shows nothing.
+        let quiet = a.fade.hidden || !a.rolling.is_empty() || a.drag.is_some();
+        Some((state, a.desktop.clone().filter(|_| !quiet), a.metrics, a.host))
+    });
+    let host = with_app(|a| a.host);
+    let Some(((elapsed, fixed, moment, slow_down, done), desktop, metrics, _)) = info else {
+        unsafe {
+            let _ = KillTimer(Some(host), REPARK_TIMER);
+        }
+        watch::unfreeze();
+        return;
+    };
+    if done {
+        unsafe {
+            let _ = KillTimer(Some(host), REPARK_TIMER);
+        }
+        watch::unfreeze();
+        return;
+    }
+    if slow_down {
+        unsafe { SetTimer(Some(host), REPARK_TIMER, REPARK_EVERY_MS, None) };
+    }
+    let (Some(d), Some(m)) = (desktop, metrics) else {
+        watch::unfreeze();
+        return;
+    };
+    let Ok(icons) = d.icons() else {
+        watch::unfreeze();
+        return;
+    };
+    let moves = with_app(|a| model::strays(&a.state.boxes, &icons, &m));
+    if moves.is_empty() {
+        // Parked again, or Explorer has had its moment and left them alone.
+        if fixed || elapsed >= REPARK_FAST_FOR_MS {
+            watch::unfreeze();
+        }
+        return;
+    }
+    if !fixed {
+        let frozen = if watch::is_frozen() { "while frozen" } else { "NOT frozen, so it showed" };
+        store::log(&format!(
+            "parking {} icons again {elapsed} ms after a {moment}, {frozen}",
+            moves.len()
+        ));
+    }
+    with_app(|a| {
+        if let Some(r) = a.repark.as_mut() {
+            r.fixed = true;
+        }
+    });
+    if let Err(e) = d.follow(&moves) {
+        store::log(&format!("could not park icons: {e}"));
+        watch::unfreeze();
+    }
+}
+
+/// Tells `watch` which icon list to freeze around drags: only while a box is rolled up,
+/// so with none, drags on the desktop are never touched.
+fn sync_freeze_target() {
+    let list = with_app(|a| {
+        let needed = a.state.boxes.iter().any(|b| b.collapsed) && !a.fade.hidden;
+        a.desktop.as_ref().map(Desktop::list).filter(|l| needed && !l.is_invalid())
+    });
+    watch::set_freeze_target(list);
+}
+
 /// Jumps every running roll to its end, before anything that needs icons where they belong.
 fn finish_rolls() {
     let host = with_app(|a| {
@@ -1071,6 +1209,17 @@ fn finish_rolls() {
         }
         place_all();
     }
+}
+
+/// Switches how a box places its icons. Going automatic closes any gaps.
+fn set_arrange(id: u64, arrange: Arrange) {
+    finish_rolls();
+    with_app(|a| {
+        if let Some(b) = a.state.boxes.iter_mut().find(|b| b.id == id) {
+            b.set_arrange(arrange);
+        }
+    });
+    place_all();
 }
 
 /// Puts the parked icons of these boxes back in their slots, leaving the boxes as they are.
@@ -1736,6 +1885,9 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         }
         WM_TIMER if wp.0 == FADE_TIMER => fade_step(),
         WM_TIMER if wp.0 == ROLL_TIMER => roll_step(),
+        WM_TIMER if wp.0 == REPARK_TIMER => repark(),
+        WM_DESKTOP_RELEASE => start_reparking(if wp.0 != 0 { "drop" } else { "click" }),
+        WM_DESKTOP_DRAG => start_reparking("drag start"),
         WM_DESKTOP_DOUBLE_CLICK => on_desktop_double_click(lp),
         WM_UPDATE => on_update_checked(wp.0 != 0, unsafe { update::take(lp) }),
         WM_UPDATE_DOWNLOADED => on_update_downloaded(unsafe { update::take(lp) }),

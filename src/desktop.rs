@@ -5,7 +5,8 @@ use crate::model::{Icon, Metrics, Move};
 use std::{cell::{Cell, RefCell}, rc::Rc};
 use windows::{
     Win32::{
-        Foundation::{HWND, LPARAM, POINT, WPARAM},
+        Foundation::{HWND, LPARAM, POINT, RECT, WPARAM},
+        Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MapWindowPoints},
         System::{
             Com::{CLSCTX_LOCAL_SERVER, CoCreateInstance, CoTaskMemFree, IServiceProvider},
             Variant::VARIANT,
@@ -119,16 +120,46 @@ impl Desktop {
         let (mut mode, mut icon_size) = (Default::default(), 0i32);
         unsafe { self.view.GetViewModeAndIconSize(&mut mode, &mut icon_size)? };
         let cell_w = spacing.x.max(1);
+        // Explorer centers the image in its cell, 2px (at 100%) below the cell's top.
+        let (icon_x, icon_y) = (((cell_w - icon_size) / 2).max(0), scale(2.0));
+        let (edge_x, edge_y) = self.right_edge();
         Ok(Metrics {
             title: scale(title),
             border: scale(border),
             pad: scale(pad),
             cell_w,
             cell_h: spacing.y.max(1),
-            // Explorer centers the image in its cell, 2px (at 100%) below the cell's top.
-            icon_x: ((cell_w - icon_size) / 2).max(0),
-            icon_y: scale(2.0),
+            icon_x,
+            icon_y,
+            // Explorer moves icons it finds off the desktop back onto it after a drop, so
+            // parked icons stay on it, but only just: one pixel of the cell, which is empty
+            // margin, inside the right edge. The image and label are past the edge of the
+            // rightmost screen, where nothing can show them.
+            park: (edge_x - 1 + icon_x, edge_y + icon_y),
         })
+    }
+
+    /// The top-right corner of the rightmost screen's work area, in view coordinates. No
+    /// screen lies to the right of it, so whatever is past it is out of sight.
+    fn right_edge(&self) -> (i32, i32) {
+        unsafe extern "system" fn rightmost(monitor: HMONITOR, _: HDC, _: *mut RECT, data: LPARAM) -> windows::core::BOOL {
+            let best = unsafe { &mut *(data.0 as *mut Option<RECT>) };
+            let mut info = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+            if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool()
+                && best.is_none_or(|b| info.rcWork.right > b.right)
+            {
+                *best = Some(info.rcWork);
+            }
+            true.into()
+        }
+        let mut best: Option<RECT> = None;
+        unsafe {
+            let _ = EnumDisplayMonitors(None, None, Some(rightmost), LPARAM(&mut best as *mut _ as isize));
+        }
+        let work = best.unwrap_or_default();
+        let mut corner = [POINT { x: work.right, y: work.top }];
+        unsafe { MapWindowPoints(None, Some(self.hwnd), &mut corner) };
+        (corner[0].x, corner[0].y)
     }
 
     fn load_items(&self) -> Result<Items> {

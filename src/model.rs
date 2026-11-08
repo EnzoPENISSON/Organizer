@@ -20,17 +20,37 @@ impl Rect {
     }
 }
 
+/// How a box places its icons.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Arrange {
+    /// One after another with no gaps. A new icon goes after the last one; dragging an
+    /// icon inside the box moves it in the order.
+    #[default]
+    Auto,
+    /// Each icon stays in the cell it was dropped in, so there can be empty cells.
+    /// Dropping on a taken cell swaps the two icons.
+    Free,
+}
+
+fn is_auto(a: &Arrange) -> bool {
+    *a == Arrange::Auto
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DesktopBox {
     pub id: u64,
     pub name: String,
     pub rect: Rect,
-    /// Shell parsing names of the icons in this box, in display order.
+    /// Shell parsing names of the icons in this box, in display order: index `i` is the
+    /// box's `i`th cell. In a free box an empty string marks an empty cell.
     pub members: Vec<String>,
     /// Rolled up to its title bar. `rect` keeps the open size, and the icons wait at
-    /// `PARKED` until the box opens again.
+    /// `Metrics::park` until the box opens again.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub collapsed: bool,
+    #[serde(default, skip_serializing_if = "is_auto")]
+    pub arrange: Arrange,
 }
 
 impl DesktopBox {
@@ -39,35 +59,83 @@ impl DesktopBox {
         if self.collapsed { Rect { h: m.title, ..self.rect } } else { self.rect }
     }
 
-    /// Where each member belongs: its slot, or `PARKED` when the box is rolled up.
+    /// The icons with their cells, skipping empty cells.
+    fn icons(&self) -> impl Iterator<Item = (usize, &String)> {
+        self.members.iter().enumerate().filter(|(_, k)| !k.is_empty())
+    }
+
+    /// Where each member belongs: its slot, or the parking spot when the box is rolled up.
     pub fn targets(&self, m: &Metrics) -> Vec<Move> {
-        self.members
-            .iter()
-            .enumerate()
+        self.icons()
             .map(|(i, key)| {
-                let (x, y) = if self.collapsed { PARKED } else { m.slot(&self.rect, i) };
+                let (x, y) = if self.collapsed { m.park } else { m.slot(&self.rect, i) };
                 Move { key: key.clone(), x, y }
             })
             .collect()
     }
+
+    /// Switching to automatic closes the gaps, keeping the icons' order.
+    pub fn set_arrange(&mut self, arrange: Arrange) {
+        self.arrange = arrange;
+        if arrange == Arrange::Auto {
+            self.members.retain(|k| !k.is_empty());
+        }
+    }
+
+    fn trim_gaps(&mut self) {
+        while self.members.last().is_some_and(String::is_empty) {
+            self.members.pop();
+        }
+    }
+
+    /// Makes cell `cell` exist, adding empty cells before it if needed.
+    fn reach(&mut self, cell: usize) {
+        if self.members.len() <= cell {
+            self.members.resize(cell + 1, String::new());
+        }
+    }
+
+    /// The empty cell closest to `cell` on the grid, `cell` itself if it is empty, or the
+    /// cell after the last icon if the box is full.
+    fn empty_cell_near(&self, cell: usize, m: &Metrics) -> usize {
+        let cols = m.columns(self.rect.w) as usize;
+        let taken = |i: usize| self.members.get(i).is_some_and(|k| !k.is_empty());
+        let distance = |i: usize| (i / cols).abs_diff(cell / cols) + (i % cols).abs_diff(cell % cols);
+        (0..m.capacity(&self.rect).max(cell + 1))
+            .filter(|&i| !taken(i))
+            .min_by_key(|&i| (distance(i), i))
+            .unwrap_or(self.members.len())
+    }
 }
 
-/// Where a rolled-up box keeps its icons: past the edge of any real screen, and inside
-/// the 16-bit range Explorer's icon list accepts.
-pub const PARKED: (i32, i32) = (30000, 30000);
+/// Where versions before 1.1 parked icons, far past any screen. Explorer moves icons it
+/// finds outside the desktop back onto it after a drop, so icons are no longer parked here,
+/// but ones left here by an older version are still recognized.
+const LEGACY_PARKED: (i32, i32) = (30000, 30000);
 
 /// Where a box's members go while it rolls open or shut and shows `h` pixels of itself.
 /// Icons can't be clipped, so each one waits, parked, until its whole cell is covered.
 pub fn rolling_targets(b: &DesktopBox, m: &Metrics, h: i32) -> Vec<Move> {
-    b.members
-        .iter()
-        .enumerate()
+    b.icons()
         .map(|(i, key)| {
             let (x, y) = m.slot(&b.rect, i);
             let covered = y - m.icon_y + m.cell_h <= b.rect.y + h;
-            let (x, y) = if covered { (x, y) } else { PARKED };
+            let (x, y) = if covered { (x, y) } else { m.park };
             Move { key: key.clone(), x, y }
         })
+        .collect()
+}
+
+/// Icons of rolled-up boxes that are not parked any more. Explorer pulls icons it finds
+/// outside the desktop back in after something is dropped on it.
+pub fn strays(boxes: &[DesktopBox], icons: &[Icon], m: &Metrics) -> Vec<Move> {
+    let by_key: HashMap<&str, &Icon> = icons.iter().map(|i| (i.key.as_str(), i)).collect();
+    boxes
+        .iter()
+        .filter(|b| b.collapsed)
+        .flat_map(|b| b.icons())
+        .filter(|(_, k)| by_key.get(k.as_str()).is_some_and(|i| (i.x, i.y) != m.park))
+        .map(|(_, k)| Move { key: k.clone(), x: m.park.0, y: m.park.1 })
         .collect()
 }
 
@@ -106,6 +174,8 @@ pub struct Metrics {
     pub cell_h: i32,
     pub icon_x: i32,
     pub icon_y: i32,
+    /// Where rolled-up boxes keep their icons, as an icon position. See `Desktop::metrics`.
+    pub park: (i32, i32),
 }
 
 impl Metrics {
@@ -120,6 +190,23 @@ impl Metrics {
             r.x + self.border + self.pad + self.icon_x + (index % cols) as i32 * self.cell_w,
             r.y + self.title + self.pad + self.icon_y + (index / cols) as i32 * self.cell_h,
         )
+    }
+
+    /// How many cells fit in the box at its current size.
+    pub fn capacity(&self, r: &Rect) -> usize {
+        let rows = ((r.h - self.title - 2 * self.pad - self.border) / self.cell_h).max(1);
+        (rows * self.columns(r.w)) as usize
+    }
+
+    /// The cell nearest to an icon position, anywhere in the box, empty or not.
+    pub fn cell_at(&self, r: &Rect, x: i32, y: i32) -> usize {
+        let cols = self.columns(r.w);
+        let rows = self.capacity(r) as i32 / cols;
+        let left = x - self.icon_x - r.x - self.border - self.pad;
+        let top = y - self.icon_y - r.y - self.title - self.pad;
+        let col = ((left + self.cell_w / 2) / self.cell_w).clamp(0, cols - 1);
+        let row = ((top + self.cell_h / 2) / self.cell_h).clamp(0, rows - 1);
+        (row * cols + col) as usize
     }
 
     pub fn nearest_slot(&self, r: &Rect, x: i32, y: i32, len: usize) -> usize {
@@ -252,8 +339,9 @@ pub struct Outcome {
 }
 
 /// Compares the icons' actual positions with the boxes and works out what the user did:
-/// an icon dragged out leaves its box, one dropped in joins (at the drop position), one
-/// dragged within its box is reordered, and deleted files drop out. A rolled-up box keeps
+/// an icon dragged out leaves its box, one dropped in joins (after the last icon, or in a
+/// free box in the cell it was dropped on), one dragged within its box is moved, and
+/// deleted files drop out. A rolled-up box keeps
 /// its parked icons wherever they are, and takes icons dropped on its title bar.
 ///
 /// A rolled-up box also keeps members missing from `icons`: while Explorer reloads the
@@ -271,22 +359,49 @@ pub fn reconcile(
     let by_key: HashMap<&str, &Icon> = icons.iter().map(|i| (i.key.as_str(), i)).collect();
 
     for b in boxes.iter_mut() {
-        let (rect, collapsed, before) = (b.rect, b.collapsed, b.members.len());
-        b.members.retain(|k| {
-            collapsed
+        let (rect, collapsed) = (b.rect, b.collapsed);
+        let stays = |k: &String| {
+            k.is_empty()
+                || collapsed
                 || by_key.get(k.as_str()).is_some_and(|i| {
                     let (cx, cy) = m.center(i.x, i.y);
                     rect.contains(cx, cy)
                 })
-        });
-        out.changed |= b.members.len() != before;
+        };
+        match b.arrange {
+            Arrange::Auto => {
+                let before = b.members.len();
+                b.members.retain(stays);
+                out.changed |= b.members.len() != before;
+            }
+            // An icon leaving a free box leaves its cell empty, so the others stay put.
+            Arrange::Free => {
+                for k in b.members.iter_mut().filter(|k| !stays(k)) {
+                    k.clear();
+                    out.changed = true;
+                }
+                b.trim_gaps();
+            }
+        }
     }
 
+    // Icons that just joined are where the box put them, not where they were dropped.
+    let mut joined: HashSet<&str> = HashSet::new();
     let owned: HashSet<String> = boxes.iter().flat_map(|b| b.members.iter().cloned()).collect();
     for icon in icons.iter().filter(|i| !owned.contains(&i.key)) {
         let (cx, cy) = m.center(icon.x, icon.y);
         if let Some(b) = boxes.iter_mut().find(|b| b.shown(m).contains(cx, cy)) {
-            b.members.push(icon.key.clone());
+            match b.arrange {
+                Arrange::Auto => b.members.push(icon.key.clone()),
+                Arrange::Free => {
+                    // Dropped on a rolled-up title bar there is no cell to aim at.
+                    let aim = if b.collapsed { 0 } else { m.cell_at(&b.rect, icon.x, icon.y) };
+                    let cell = b.empty_cell_near(aim, m);
+                    b.reach(cell);
+                    b.members[cell] = icon.key.clone();
+                }
+            }
+            joined.insert(icon.key.as_str());
             out.changed = true;
         }
     }
@@ -318,23 +433,36 @@ pub fn reconcile(
             })
         };
         let dropped: Vec<String> = b
-            .members
-            .iter()
-            .filter(|k| !on_grid(by_key[k.as_str()]))
-            .cloned()
+            .icons()
+            .filter(|(_, k)| !joined.contains(k.as_str()) && !on_grid(by_key[k.as_str()]))
+            .map(|(_, k)| k.clone())
             .collect();
         for key in dropped {
             let icon = by_key[key.as_str()];
             let from = b.members.iter().position(|k| *k == key).unwrap();
-            let to = m.nearest_slot(&b.rect, icon.x, icon.y, b.members.len());
-            if from != to {
-                let k = b.members.remove(from);
-                b.members.insert(to, k);
-                out.changed = true;
+            match b.arrange {
+                Arrange::Auto => {
+                    let to = m.nearest_slot(&b.rect, icon.x, icon.y, b.members.len());
+                    if from != to {
+                        let k = b.members.remove(from);
+                        b.members.insert(to, k);
+                        out.changed = true;
+                    }
+                }
+                // Into the cell it was dropped on: an empty one, or a swap with its icon.
+                Arrange::Free => {
+                    let to = m.cell_at(&b.rect, icon.x, icon.y);
+                    if from != to {
+                        b.reach(to);
+                        b.members.swap(from, to);
+                        b.trim_gaps();
+                        out.changed = true;
+                    }
+                }
             }
         }
 
-        for (i, key) in b.members.iter().enumerate() {
+        for (i, key) in b.icons() {
             let (x, y) = m.slot(&b.rect, i);
             let icon = by_key[key.as_str()];
             if icon.x != x || icon.y != y {
@@ -344,8 +472,8 @@ pub fn reconcile(
     }
 
     let owned: HashSet<&str> = boxes.iter().flat_map(|b| b.members.iter().map(String::as_str)).collect();
-    let mut taken: Vec<(i32, i32)> = icons.iter().filter(|i| !is_parked(i.x, i.y)).map(|i| (i.x, i.y)).collect();
-    for icon in icons.iter().filter(|i| is_parked(i.x, i.y) && !owned.contains(i.key.as_str())) {
+    let mut taken: Vec<(i32, i32)> = icons.iter().filter(|i| !is_parked(m, i.x, i.y)).map(|i| (i.x, i.y)).collect();
+    for icon in icons.iter().filter(|i| is_parked(m, i.x, i.y) && !owned.contains(i.key.as_str())) {
         let area = area_of(&Rect { x: 0, y: 0, w: 1, h: 1 });
         if let Some((x, y)) = free_cell(&area, boxes, &taken, m) {
             out.moves.push(Move { key: icon.key.clone(), x, y });
@@ -392,9 +520,9 @@ pub fn restore_layout(
     moves
 }
 
-/// Far enough out to be one of ours: no real screen reaches this.
-fn is_parked(x: i32, y: i32) -> bool {
-    x >= PARKED.0 - 1000 && y >= PARKED.1 - 1000
+/// At the parking spot, or the one older versions used, which no real screen reaches.
+fn is_parked(m: &Metrics, x: i32, y: i32) -> bool {
+    (x, y) == m.park || (x >= LEGACY_PARKED.0 - 1000 && y >= LEGACY_PARKED.1 - 1000)
 }
 
 /// The first grid cell, column by column from the top-left as Explorer arranges icons,
@@ -423,10 +551,14 @@ fn free_cell(area: &Rect, boxes: &[DesktopBox], icons: &[(i32, i32)], m: &Metric
 mod tests {
     use super::*;
 
-    const M: Metrics = Metrics { title: 30, border: 4, pad: 6, cell_w: 100, cell_h: 100, icon_x: 0, icon_y: 0 };
+    // Parked with one pixel of the cell inside the right edge of AREA, as on a real desktop.
+    const M: Metrics =
+        Metrics { title: 30, border: 4, pad: 6, cell_w: 100, cell_h: 100, icon_x: 0, icon_y: 0, park: (1919, 0) };
     // What a real desktop reports: a 76x100 cell with a 48px icon centered in it.
-    const REAL: Metrics = Metrics { title: 26, border: 3, pad: 4, cell_w: 76, cell_h: 100, icon_x: 14, icon_y: 2 };
+    const REAL: Metrics =
+        Metrics { title: 26, border: 3, pad: 4, cell_w: 76, cell_h: 100, icon_x: 14, icon_y: 2, park: (1933, 2) };
     const AREA: Rect = Rect { x: 0, y: 0, w: 1920, h: 1040 };
+    const PARKED: (i32, i32) = M.park;
 
     fn area(_: &Rect) -> Rect {
         AREA
@@ -438,7 +570,11 @@ mod tests {
             rect: Rect { x: 100, y: 100, w: 320, h: 400 },
             members: members.iter().map(|s| s.to_string()).collect(),
             collapsed: false,
+            arrange: Arrange::Auto,
         }
+    }
+    fn free_box(members: &[&str]) -> DesktopBox {
+        DesktopBox { arrange: Arrange::Free, ..make_box(members) }
     }
     fn rolled_up(members: &[&str]) -> DesktopBox {
         DesktopBox { collapsed: true, ..make_box(members) }
@@ -494,14 +630,87 @@ mod tests {
     }
 
     #[test]
-    fn icon_dropped_in_box_joins_at_drop_position() {
+    fn icon_dropped_in_an_automatic_box_goes_after_the_last_one() {
         let mut bs = [make_box(&["a", "b"])];
         let (s0, s1) = (slot(&bs[0], 0), slot(&bs[0], 1));
+        // Dropped on the first cell, it still goes last.
         let icons = [icon("a", s0), icon("b", s1), icon("new", (s0.0 + 5, s0.1 + 5))];
         let o = reconcile(&mut bs, &icons, &M, &area);
-        assert_eq!(members(&bs[0]), ["new", "a", "b"]);
+        assert_eq!(members(&bs[0]), ["a", "b", "new"]);
         assert!(o.changed);
-        assert_eq!(o.moves.len(), 3);
+        assert_eq!(o.moves, [Move { key: "new".into(), x: slot(&bs[0], 2).0, y: slot(&bs[0], 2).1 }]);
+    }
+
+    #[test]
+    fn icon_dropped_in_a_free_box_stays_in_its_cell() {
+        let mut bs = [free_box(&["a"])];
+        let s4 = slot(&bs[0], 4); // second row, middle
+        let icons = [icon("a", slot(&bs[0], 0)), icon("new", (s4.0 + 8, s4.1 - 6))];
+        let o = reconcile(&mut bs, &icons, &M, &area);
+        assert_eq!(members(&bs[0]), ["a", "", "", "", "new"]);
+        assert_eq!(o.moves, [Move { key: "new".into(), x: s4.0, y: s4.1 }]);
+    }
+
+    #[test]
+    fn icon_dropped_on_a_taken_cell_of_a_free_box_takes_the_nearest_empty_one() {
+        let mut bs = [free_box(&["a"])];
+        let s0 = slot(&bs[0], 0);
+        let icons = [icon("a", s0), icon("new", (s0.0 + 5, s0.1 + 5))];
+        reconcile(&mut bs, &icons, &M, &area);
+        assert_eq!(members(&bs[0]), ["a", "new"]);
+    }
+
+    #[test]
+    fn icon_leaving_a_free_box_leaves_a_gap() {
+        let mut bs = [free_box(&["a", "b", "c"])];
+        let icons = [icon("a", slot(&bs[0], 0)), icon("b", (1500, 800)), icon("c", slot(&bs[0], 2))];
+        let o = reconcile(&mut bs, &icons, &M, &area);
+        assert_eq!(members(&bs[0]), ["a", "", "c"]);
+        assert!(o.moves.is_empty(), "the others stay where they are: {:?}", o.moves);
+    }
+
+    #[test]
+    fn dragging_onto_a_taken_cell_of_a_free_box_swaps() {
+        let mut bs = [free_box(&["a", "b", "c"])];
+        let s2 = slot(&bs[0], 2);
+        let icons = [icon("a", (s2.0 + 7, s2.1)), icon("b", slot(&bs[0], 1)), icon("c", s2)];
+        reconcile(&mut bs, &icons, &M, &area);
+        assert_eq!(members(&bs[0]), ["c", "b", "a"]);
+    }
+
+    #[test]
+    fn dragging_into_an_empty_cell_of_a_free_box_moves_there() {
+        let mut bs = [free_box(&["a", "b"])];
+        let s5 = slot(&bs[0], 5);
+        let icons = [icon("a", (s5.0 - 4, s5.1 + 3)), icon("b", slot(&bs[0], 1))];
+        reconcile(&mut bs, &icons, &M, &area);
+        assert_eq!(members(&bs[0]), ["", "b", "", "", "", "a"]);
+    }
+
+    #[test]
+    fn switching_a_free_box_to_automatic_closes_the_gaps() {
+        let mut b = free_box(&["a", "", "", "b"]);
+        b.set_arrange(Arrange::Auto);
+        assert_eq!(members(&b), ["a", "b"]);
+        let moves = b.targets(&M);
+        assert_eq!(moves.len(), 2);
+    }
+
+    #[test]
+    fn empty_cells_are_never_moved_or_parked() {
+        let mut b = free_box(&["a", "", "b"]);
+        assert_eq!(b.targets(&M).len(), 2);
+        b.collapsed = true;
+        assert!(b.targets(&M).iter().all(|t| !t.key.is_empty()));
+        assert_eq!(rolling_targets(&b, &M, 1000).len(), 2);
+    }
+
+    #[test]
+    fn automatic_boxes_are_saved_as_before() {
+        let json = serde_json::to_string(&make_box(&["a"])).unwrap();
+        assert!(!json.contains("arrange"), "{json}");
+        let json = serde_json::to_string(&free_box(&["a"])).unwrap();
+        assert!(json.contains(r#""arrange":"free""#), "{json}");
     }
 
     #[test]
@@ -649,6 +858,33 @@ mod tests {
             Move { key: "b".into(), x: slot(&bs[0], 1).0, y: slot(&bs[0], 1).1 },
         ]);
         assert!(bs[0].collapsed);
+    }
+
+    #[test]
+    fn strays_are_rolled_up_icons_explorer_pulled_back_on_screen() {
+        let bs = [rolled_up(&["a", "b"]), make_box(&["c"])];
+        let icons = [icon("a", PARKED), icon("b", (1800, 930)), icon("c", (5, 5)), icon("loose", (9, 9))];
+        assert_eq!(strays(&bs, &icons, &M), [Move { key: "b".into(), x: PARKED.0, y: PARKED.1 }]);
+    }
+
+    #[test]
+    fn icons_parked_by_an_older_version_move_to_the_new_spot_or_come_back() {
+        let bs = [rolled_up(&["a"])];
+        let icons = [icon("a", LEGACY_PARKED), icon("orphan", LEGACY_PARKED)];
+        assert_eq!(strays(&bs, &icons, &M), [Move { key: "a".into(), x: PARKED.0, y: PARKED.1 }]);
+        let mut bs = bs;
+        let o = reconcile(&mut bs, &icons, &M, &area);
+        let back = o.moves.iter().find(|m| m.key == "orphan").expect("the orphan comes back");
+        assert!(AREA.contains(back.x, back.y), "{back:?}");
+    }
+
+    #[test]
+    fn a_parked_icon_is_never_inside_a_box() {
+        // Even a box against the right edge of the screen: the parked cell's center is past it.
+        let mut bs = [make_box(&[])];
+        bs[0].rect = Rect { x: 1600, y: 0, w: 320, h: 400 };
+        let o = reconcile(&mut bs, &[icon("p", PARKED)], &M, &area);
+        assert!(bs[0].members.is_empty() && !o.changed);
     }
 
     #[test]
