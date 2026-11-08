@@ -1,6 +1,20 @@
-# Organizer
+<p align="center">
+  <img src="assets/logo.svg" width="96" alt="Organizer logo">
+</p>
 
-Group your Windows desktop icons into glowing, translucent boxes that you can style with CSS.
+<h1 align="center">Organizer</h1>
+
+<p align="center">
+  Group your Windows desktop icons into glowing, translucent boxes that you can style with CSS.
+</p>
+
+<p align="center">
+  <a href="https://github.com/EnzoPENISSON/Organizer/releases/latest"><img src="https://img.shields.io/github/v/release/EnzoPENISSON/Organizer?label=download" alt="Latest release"></a>
+  <a href="https://buymeacoffee.com/enzop2503o"><img src="https://img.shields.io/badge/Buy%20me%20a%20coffee-FFDD00?logo=buymeacoffee&logoColor=black" alt="Buy me a coffee"></a>
+</p>
+
+![Desktop icons grouped into Apps, Work, Media, Games and Downloads boxes](docs/images/desktop.png)
+
 Built to stay out of the way: about 2 MB of RAM, almost no CPU, and it stops checking
 entirely while a fullscreen game runs.
 
@@ -46,6 +60,12 @@ Organizer runs from the system tray (it may be under the `^` overflow arrow).
 
 Deleting a box leaves its icons where they are. Moving a box over loose icons adds them to it.
 A box grows when it is too small for its icons.
+
+Double-clicking the desktop fades the boxes and icons out, leaving only the wallpaper
+
+<p align="center">
+  <img src="docs/images/tray-menu.png" width="480" alt="The tray menu">
+</p>
 
 ## Customize with CSS
 
@@ -139,3 +159,12 @@ create `theme.css` if it is missing. Run it with output redirected, for example
 - `src/store.rs`: saved state
 
 Run the unit tests with `cargo test`.
+
+The README images are drawn by `python assets/make-images.py`, and the app icon by
+`assets/make-icon.ps1`.
+
+## Support
+
+Organizer is free. If it tidies up your desktop, you can buy me a coffee:
+
+<a href="https://buymeacoffee.com/enzop2503o"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy me a coffee" height="48"></a>
